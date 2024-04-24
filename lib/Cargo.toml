@@ -1,0 +1,19 @@
+[package]
+name = "power-reqwest-lib"
+version = "0.1.0"
+edition = "2021"
+description = "lib for reqwest!"
+license = "MIT"
+documentation = "https://docs.rs/power-reqwest-lib"
+homepage = "https://github.com/powermacros/power-reqwest"
+repository = "https://github.com/powermacros/power-reqwest"
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = { version = "1" }
+convert_case = "0.6"
+syn-prelude = { version = "0.1.6" }
+nom = "7.1.3"
+
+[features]
