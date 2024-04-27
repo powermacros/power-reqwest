@@ -1,18 +1,25 @@
 use proc_macro2::Span;
-use syn::{Ident, LitBool, LitFloat, LitInt, LitStr};
+use syn::{
+    parse::{Parse, ParseStream},
+    punctuated::Punctuated,
+    token::{Brace, Bracket, Paren},
+    ExprRange, Ident, LitBool, LitFloat, LitInt, LitStr, Token,
+};
+
+pub type ClientParams = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
 
 pub struct Client {
     pub name: Ident,
-    pub config: Option<Vec<DataField>>,
-    pub common: Option<Common>,
+    pub params: Option<ClientParams>,
+    pub hooks: Option<Hooks>,
     pub auth: Option<Auth>,
     pub signing: Option<Signing>,
     pub apis: Vec<Api>,
 }
 
-pub struct Common {
+pub struct Hooks {
     pub(crate) span: Span,
-    pub unwrap_response: Option<syn::Path>,
+    pub on_submit: Option<syn::Path>,
 }
 
 pub struct Signing {
@@ -26,71 +33,258 @@ pub struct Auth {
 }
 
 pub struct Api {
-    pub name: LitStr,
+    pub name: Ident,
     pub method: Ident,
+    pub paren: Paren,
     pub url: LitStr,
-    pub request: Option<ApiRequest>,
-    pub response: Vec<DataField>,
+    pub request: ApiRequest,
+    pub response: Option<ApiResponse>,
 }
+
+pub type RequestHeaders = BracedConfig<(), (), (Token![=], Expr)>;
+pub type RequestQueries = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
+pub type RequestForm = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
+pub type RequestJson = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
 
 pub struct ApiRequest {
-    pub header: Option<Vec<ApiHeader>>,
-    pub data: Option<Vec<DataField>>,
+    pub brace: Brace,
+    pub header: Option<RequestHeaders>,
+    pub query: Option<RequestQueries>,
+    pub form: Option<RequestForm>,
+    pub json: Option<RequestJson>,
 }
 
-pub struct ApiHeader {
-    pub name: LitStr,
-    pub value: Value,
+pub type ResponseHeaders = BracedConfig<(), (Token![->], Ident), ()>;
+pub type ResponseCookies = BracedConfig<(), (Token![->], Ident), ()>;
+pub type ResponseJson = BracedConfig<Type<(Token![->], Ident), ()>, (Token![->], Ident), ()>;
+pub type ResponseForm = BracedConfig<Type<(Token![->], Ident), ()>, (Token![->], Ident), ()>;
+
+pub struct ApiResponse {
+    pub brace: Brace,
+    pub header: Option<ResponseHeaders>,
+    pub cookie: Option<ResponseCookies>,
+    pub json: Option<ResponseJson>,
+    pub form: Option<ResponseForm>,
 }
 
-pub struct DataField {
-    pub name: Ident,
-    pub typ: DataType,
-    pub optional: Option<Span>,
-    pub value: Option<Value>,
+pub trait ParseType {
+    fn peek(input: ParseStream) -> syn::Result<()>;
+    fn parse_type(input: ParseStream) -> syn::Result<Self>
+    where
+        Self: Sized;
 }
 
-pub enum DataType {
-    String(Span),
+pub trait TryParse {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>>
+    where
+        Self: Sized;
+}
+
+impl ParseType for () {
+    fn peek(_input: ParseStream) -> syn::Result<()> {
+        Ok(())
+    }
+    fn parse_type(_input: ParseStream) -> syn::Result<Self> {
+        Ok(())
+    }
+}
+
+impl TryParse for () {
+    fn try_parse(_input: ParseStream) -> syn::Result<Option<Self>> {
+        Ok(Some(()))
+    }
+}
+
+impl<T: Parse> TryParse for (Token![->], T) {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        if input.peek(Token![->]) {
+            let arrow = input.parse::<Token![->]>()?;
+            Ok(Some((arrow, input.parse()?)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<T: Parse> TryParse for (Token![=], T) {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        if input.peek(Token![=]) {
+            let arrow = input.parse::<Token![=]>()?;
+            Ok(Some((arrow, input.parse()?)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+pub struct BracedConfig<T: ParseType, A: TryParse, X: TryParse> {
+    pub token: Span,
+    pub brace: Brace,
+    pub fields: Vec<Field<T, A, X>>,
+}
+
+pub enum Type<A: TryParse, X: TryParse> {
+    Constant(Constant),
+    String(StringType),
     Bool(Span),
-    Int(Span),
-    Uint(Span),
-    Float(Span),
-    Object(ObjectType),
-    List(Box<DataType>),
+    Integer(IntegerType),
+    Float(FloatType),
+    Object(ObjectType<A, X>),
+    Datetime(DateTimeStringType),
+    Json(JsonStringType<A, X>),
+    Map(Span),
+    List(ListType<A, X>),
 }
 
-pub struct ObjectType {
-    pub fields: Vec<ObjectFieldType>,
+pub struct StringType {
+    pub span: Span,
 }
 
-pub struct ObjectFieldType {
+pub struct IntegerType {
+    // uint, int
+    pub token: Ident,
+    pub limits: Option<IntLimits>,
+}
+
+pub struct IntLimits {
+    pub paren: Paren,
+    pub limits: Punctuated<IntLimit, Token![,]>,
+}
+
+pub enum IntLimit {
+    Range(ExprRange),
+    Opt(LitInt),
+}
+
+pub struct FloatType {
+    pub span: Span,
+    pub limits: Option<FloatLimits>,
+}
+
+pub struct FloatLimits {
+    pub paren: Paren,
+    pub limits: Punctuated<ExprRange, Token![,]>,
+}
+
+pub struct DateTimeStringType {
+    pub span: Span,
+    pub paren: Paren,
+    pub format: LitStr,
+}
+
+pub struct JsonStringType<A: TryParse, X: TryParse> {
+    pub span: Span,
+    pub paren: Paren,
+    pub typ: Box<Type<A, X>>,
+}
+
+pub struct ListType<A: TryParse, X: TryParse> {
+    pub bracket: Bracket,
+    pub element_type: Box<Type<A, X>>,
+}
+
+pub type ObjectField<A, X> = Field<Type<A, X>, A, X>;
+
+pub struct ObjectType<A: TryParse, X: TryParse> {
+    pub brace: Brace,
+    pub fields: Vec<ObjectField<A, X>>,
+}
+
+pub struct Field<T: ParseType, A: TryParse, X: TryParse> {
+    pub name: LitStr,
+    pub optional: Option<Token![?]>,
+    pub typ: T,
+    pub alias: Option<A>,
+    pub expr: Option<X>,
+}
+
+pub struct ObjectFieldAlias {
+    pub right_arrow: Token![->],
+    pub map_to: Ident,
+}
+
+pub enum Expr {
+    Constant(Constant),
+    Variable(Variable),
+    Json(JsonStringifyFn),
+    Format(FormatFn),
+    Datetime(DatetimeFn),
+    Timestamp(UnixTimestampUintFn),
+    Join(JoinStringFn),
+    Or(OrExpr),
+}
+
+pub struct Variable {
+    pub dollar: Span,
     pub name: Ident,
-    pub value_type: DataType,
-    pub value: Option<Value>,
+    pub typ: Option<Type<(), ()>>,
 }
 
-pub enum Value {
-    Var(Ident),
+pub enum Constant {
     String(LitStr),
     Bool(LitBool),
     Int(LitInt),
     Float(LitFloat),
-    Object(ObjectValue),
-    Array(ArrayValue),
+    Object(ObjectConstant),
+    Array(ConstantArray),
 }
 
-pub struct ObjectValue {
+pub struct ObjectConstant {
     pub span: Span,
-    pub fields: Vec<ObjectFieldValue>,
+    pub fields: Vec<ObjectConstantField>,
 }
 
-pub struct ObjectFieldValue {
+pub struct ObjectConstantField {
     pub name: Ident,
-    pub value: Value,
+    pub value: Constant,
 }
 
-pub struct ArrayValue {
-    pub(crate) span: Span,
-    pub elements: Vec<Value>,
+pub struct ConstantArray {
+    pub span: Span,
+    pub elements: Vec<Constant>,
+}
+
+pub struct FormatFn {
+    pub fn_token: Span,
+    pub paren: Paren,
+    pub format_text: LitStr,
+    pub args: Option<Punctuated<Expr, Token![,]>>,
+}
+
+pub struct JsonStringifyFn {
+    pub fn_token: Span,
+    pub paren: Paren,
+    pub variable: Variable,
+}
+
+pub struct DatetimeFn {
+    pub token: Span,
+    pub paren: Paren,
+    pub variable: Variable,
+    pub format: LitStr,
+}
+
+pub struct JoinStringFn {
+    pub token: Span,
+    pub paren: Paren,
+    pub variable: Variable,
+    pub sep: LitStr,
+}
+
+pub struct UnixTimestampUintFn {
+    pub token: Span,
+    pub paren: Paren,
+    pub variable: Variable,
+}
+
+pub struct OrExpr {
+    pub variable: Variable,
+    pub or: Token![||],
+    pub default: Constant,
 }

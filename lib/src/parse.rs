@@ -1,31 +1,20 @@
+use proc_macro2::Span;
 use syn::{
     parse::{Parse, ParseBuffer, ParseStream},
-    spanned::Spanned,
-    token::Brace,
-    Ident, LitBool, LitFloat, LitInt, LitStr, Token,
+    ExprRange, Ident, LitStr, Token,
 };
 use syn_prelude::{
-    ParseAsIdent, ParseAsLitStr, ToErr, ToSynError, TryParseAsIdent, TryParseOneOfIdents,
-    TryParseTokens,
+    ForkWithParsible, ParseAsIdent, ParseAsLitStr, ToErr, ToSpan, ToSynError, TryParseAsIdent,
+    TryParseOneOfIdents, TryParseTokens,
 };
 
-use crate::{
-    model::{
-        Api, ArrayValue, Client, DataField, DataType, ObjectFieldType, ObjectFieldValue,
-        ObjectType, ObjectValue, Signing, Value,
-    },
-    ApiHeader, ApiRequest, Auth, Common,
-};
-
-trait TryParseComma {
-    fn try_parse_comma(&self) -> syn::Result<()>;
-}
+use crate::model::*;
 
 impl Parse for Client {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let whole_span = input.span();
         let mut client_name = None;
-        let mut config = None;
+        let mut params = None;
         let mut signing = None;
         let mut auth = None;
         let mut common = None;
@@ -44,15 +33,13 @@ impl Parse for Client {
                     }
                     client_name = Some(name);
                 }
-                ClientDecl::Config(decl, brace) => {
-                    if config.is_some() {
-                        brace
-                            .span
-                            .close()
+                ClientDecl::Params(decl) => {
+                    if params.is_some() {
+                        decl.token
                             .to_syn_error("duplicate client config defined previously")
                             .to_err()?;
                     }
-                    config = Some(decl);
+                    params = Some(decl);
                 }
                 ClientDecl::Signature(decl) => {
                     if signing.is_some() {
@@ -85,8 +72,8 @@ impl Parse for Client {
         }
         Ok(Self {
             name: client_name.ok_or(whole_span.to_syn_error("missing client name!"))?,
-            config,
-            common,
+            params,
+            hooks: common,
             auth,
             signing,
             apis: api_list,
@@ -96,11 +83,11 @@ impl Parse for Client {
 
 enum ClientDecl {
     Name(Ident, Ident),
-    Config(Vec<DataField>, Brace),
+    Params(ClientParams),
     Signature(Signing),
     Auth(Auth),
     Api(Api),
-    Common(Common),
+    Common(Hooks),
 }
 
 impl Parse for ClientDecl {
@@ -110,15 +97,14 @@ impl Parse for ClientDecl {
         } else if let Some(ident) = input.try_parse_as_ident("name", true) {
             input.parse::<Token![:]>()?;
             Ok(Self::Name(ident, input.parse()?))
-        } else if let Some(_ident) = input.try_parse_as_ident("config", false) {
+        } else if let Some(ident) = input.try_parse_as_ident("params", false) {
             input.try_parse_colon();
-            let (items, brace) = parse_config_fields(input)?;
-            Ok(Self::Config(items, brace))
+            Ok(Self::Params(ClientParams::parse(input, ident.span())?))
         } else if let Some(signing) = Signing::try_parse(input)? {
             Ok(Self::Signature(signing))
         } else if let Some(auth) = Auth::try_parse(input)? {
             Ok(Self::Auth(auth))
-        } else if let Some(common) = Common::try_parse(input)? {
+        } else if let Some(common) = Hooks::try_parse(input)? {
             Ok(Self::Common(common))
         } else {
             input.span().to_syn_error("unexpect config field").to_err()
@@ -126,37 +112,31 @@ impl Parse for ClientDecl {
     }
 }
 
-impl Common {
+impl Hooks {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(_common) = input.try_parse_as_ident("common", false) {
+        if let Some(_common) = input.try_parse_as_ident("hooks", false) {
             input.try_parse_colon();
             let inner: ParseBuffer;
             let brace = syn::braced!(inner in input);
-            let mut unwrap_response = None;
+            let mut on_submit = None;
             while !inner.is_empty() {
                 if let Some(_) = inner.try_parse_comma() {
                     continue;
                 }
 
-                if let Some(token) = inner.try_parse_as_ident("unwrap_response", false) {
+                if let Some(token) = inner.try_parse_as_ident("on_submit", false) {
                     inner.parse::<Token![:]>()?;
-                    if unwrap_response.is_some() {
+                    if on_submit.is_some() {
                         token.span().to_syn_error("duplicate config").to_err()?;
                     }
-                    unwrap_response = Some(inner.parse()?);
+                    on_submit = Some(inner.parse()?);
                 } else {
-                    inner
-                        .span()
-                        .to_syn_error("unexpect field for common config")
-                        .to_err()?;
+                    inner.span().to_syn_error("unsupported hook").to_err()?;
                 }
             }
             let span = brace.span.close();
 
-            Ok(Some(Self {
-                span,
-                unwrap_response,
-            }))
+            Ok(Some(Self { span, on_submit }))
         } else {
             Ok(None)
         }
@@ -244,110 +224,32 @@ impl Auth {
 impl Api {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
         if let Some(method) = input.try_parse_one_of_idents(("get", "post", "put", "delete")) {
-            let parened: ParseBuffer;
-            syn::parenthesized!(parened in input);
-            let url: LitStr = parened.parse()?;
-            if !parened.is_empty() {
-                parened.span().to_syn_error("unexpected content").to_err()?;
+            let name = input.parse_as_ident()?;
+            let url_input: ParseBuffer;
+            let paren = syn::parenthesized!(url_input in input);
+            let url: LitStr = url_input.parse()?;
+            if !url_input.is_empty() {
+                url_input
+                    .span()
+                    .to_syn_error("unexpected content")
+                    .to_err()?;
             }
 
-            let inner: ParseBuffer;
-            let brace = syn::braced!(inner in input);
-
-            let mut name = None;
-            let mut response = None;
-            let mut header = None;
-            let mut request_data = None;
-
-            while !inner.is_empty() {
-                if let Some(_) = inner.try_parse_comma() {
-                    continue;
-                }
-                if let Some(_name) = inner.try_parse_as_ident("name", false) {
-                    inner.parse::<Token![:]>()?;
-                    if name.is_some() {
-                        _name.to_syn_error("name has been configured").to_err()?;
-                    }
-                    name = Some(inner.parse_as_lit_str()?);
-                } else if let Some(_) = inner.try_parse_as_ident("request", false) {
-                    inner.try_parse_colon();
-                    let request: ParseBuffer;
-                    syn::braced!(request in inner);
-                    while !request.is_empty() {
-                        if let Some(_) = request.try_parse_comma() {
-                            continue;
-                        };
-                        if let Some(_config) = request.try_parse_as_ident("header", false) {
-                            request.try_parse_colon();
-                            if header.is_some() {
-                                _config
-                                    .span()
-                                    .to_syn_error("duplicate header config")
-                                    .to_err()?;
-                            }
-                            let header_buffer: ParseBuffer;
-                            syn::braced!(header_buffer in request);
-                            let mut list = vec![];
-                            while !header_buffer.is_empty() {
-                                if let Some(_) = header_buffer.try_parse_comma() {
-                                    continue;
-                                }
-                                list.push(header_buffer.parse()?);
-                            }
-                            header = Some(list);
-                        } else if let Some(_) = request.try_parse_as_ident("data", false) {
-                            request.try_parse_colon();
-                            let (items, brace) = parse_config_fields(&request)?;
-                            if request_data.is_some() {
-                                brace
-                                    .span
-                                    .close()
-                                    .to_syn_error("request data has been defined previously")
-                                    .to_err()?;
-                            }
-                            request_data = Some(items);
-                        } else {
-                            request
-                                .span()
-                                .to_syn_error("unexpect field for request config")
-                                .to_err()?;
-                        }
-                    }
-                } else if let Some(_response) = inner.try_parse_as_ident("response", false) {
-                    inner.try_parse_colon();
-                    if response.is_some() {
-                        _response.span().to_syn_error("duplicated field").to_err()?;
-                    }
-                    let (items, _) = parse_config_fields(&inner)?;
-                    response = Some(items);
-                } else {
-                    inner
-                        .span()
-                        .to_syn_error("unexpect contents for api config")
-                        .to_err()?;
-                }
-            }
+            let request = input.parse()?;
+            let response = if input.peek(Token![->]) {
+                input.parse::<Token![->]>()?;
+                Some(input.parse()?)
+            } else {
+                None
+            };
 
             Ok(Some(Self {
-                name: name.ok_or(brace.span.close().to_syn_error("missing api name"))?,
-                response: response.ok_or(
-                    brace
-                        .span
-                        .close()
-                        .to_syn_error("missing response type config"),
-                )?,
-                request: {
-                    if request_data.is_some() || header.is_some() {
-                        Some(ApiRequest {
-                            header: header,
-                            data: request_data,
-                        })
-                    } else {
-                        None
-                    }
-                },
                 method,
+                name,
+                paren,
                 url,
+                request,
+                response,
             }))
         } else {
             Ok(None)
@@ -355,82 +257,245 @@ impl Api {
     }
 }
 
-fn parse_config_fields(input: ParseStream) -> syn::Result<(Vec<DataField>, Brace)> {
-    let inner: ParseBuffer;
-    let brace = syn::braced!(inner in input);
-    let mut items: Vec<DataField> = vec![];
-    while !inner.is_empty() {
-        if let Some(_) = inner.try_parse_comma() {
-            continue;
-        }
-        let item: DataField = inner.parse()?;
-        if !items.is_empty() {
-            if items.iter().find(|i| i.name.eq(&item.name)).is_some() {
-                item.name
+impl Parse for ApiRequest {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let inner: ParseBuffer;
+        let brace = syn::braced!(inner in input);
+        let mut request = Self {
+            brace,
+            header: None,
+            query: None,
+            form: None,
+            json: None,
+        };
+
+        while !inner.is_empty() {
+            if let Some(_comma) = inner.try_parse_comma() {
+                continue;
+            }
+
+            if let Some(json) = inner.try_parse_as_ident("json", false) {
+                if let Some(prev) = request.json {
+                    (json.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated json config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                request.json = Some(RequestJson::parse(input, json.span())?);
+            } else if let Some(query) = inner.try_parse_as_ident("query", false) {
+                if let Some(prev) = request.query {
+                    (query.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated query config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                request.query = Some(RequestQueries::parse(&inner, query.span())?);
+            } else if let Some(form) = inner.try_parse_as_ident("form", false) {
+                if let Some(prev) = &request.form {
+                    (form.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated form config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                request.form = Some(RequestForm::parse(&inner, form.span())?);
+            } else if let Some(header) = inner.try_parse_as_ident("header", false) {
+                if let Some(prev) = &request.header {
+                    (header.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated header config")
+                        .to_err()?;
+                }
+                input.try_parse_colon();
+                request.header = Some(RequestHeaders::parse(&inner, header.span())?);
+            } else {
+                inner
                     .span()
-                    .to_syn_error("same config key exists")
+                    .to_syn_error("unexpected config item")
                     .to_err()?;
             }
         }
-        items.push(item);
+
+        Ok(request)
     }
-    Ok((items, brace))
 }
 
-impl Parse for ApiHeader {
+impl Parse for ApiResponse {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let name = input.parse_as_lit_str()?;
-        input.parse::<Token![=]>()?;
-        let value = input.parse()?;
-        Ok(Self { name, value })
+        let inner: ParseBuffer;
+        let brace = syn::braced!(inner in input);
+        let mut response = Self {
+            brace,
+            header: None,
+            cookie: None,
+            json: None,
+            form: None,
+        };
+
+        while !inner.is_empty() {
+            if let Some(_comma) = inner.try_parse_comma() {
+                continue;
+            }
+
+            if let Some(json) = inner.try_parse_as_ident("json", false) {
+                if let Some(prev) = &response.json {
+                    (json.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated json config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                response.json = Some(ResponseJson::parse(&inner, json.span())?);
+            } else if let Some(form) = inner.try_parse_as_ident("form", false) {
+                if let Some(prev) = &response.form {
+                    (form.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated form config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                response.form = Some(ResponseForm::parse(&inner, form.span())?);
+            } else if let Some(cookie) = inner.try_parse_as_ident("cookie", false) {
+                if let Some(prev) = &response.cookie {
+                    (cookie.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated cookie config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                response.cookie = Some(ResponseCookies::parse(&inner, cookie.span())?);
+            } else if let Some(header) = inner.try_parse_as_ident("header", false) {
+                if let Some(prev) = &response.header {
+                    (header.span(), prev.token)
+                        .to_span()
+                        .to_syn_error("duplicated header config")
+                        .to_err()?;
+                }
+                inner.try_parse_colon();
+                response.header = Some(ResponseHeaders::parse(&inner, header.span())?);
+            } else {
+                inner
+                    .span()
+                    .to_syn_error("unexpected contents in response config")
+                    .to_err()?;
+            }
+        }
+
+        Ok(response)
     }
 }
 
-impl Parse for DataField {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let name = input.parse_as_ident()?;
-        let optional = if let Some(tk) = input.try_parse_question() {
-            Some(tk.span())
-        } else {
-            None
-        };
-        input.parse::<Token![:]>()?;
-        let typ = input.parse()?;
-        let default_value = if let Some(_) = input.try_parse_eq() {
-            Some(input.parse()?)
-        } else {
-            None
-        };
-
+impl<T: ParseType, A: TryParse, X: TryParse> BracedConfig<T, A, X> {
+    fn parse(input: ParseStream, token: Span) -> syn::Result<Self> {
+        let inner: ParseBuffer;
+        let brace = syn::braced!(inner in input);
+        let mut fields: Vec<Field<T, A, X>> = vec![];
+        while !inner.is_empty() {
+            if let Some(_) = inner.try_parse_comma() {
+                continue;
+            }
+            let field: Field<T, A, X> = inner.parse()?;
+            if let Some(prev) = fields.iter().find(|f| f.name.eq(&field.name)) {
+                (field.name.span(), prev.name.span())
+                    .to_span()
+                    .to_syn_error("duplicated field")
+                    .to_err()?;
+            }
+            fields.push(field);
+        }
         Ok(Self {
-            name,
-            typ,
-            value: default_value,
-            optional,
+            token,
+            brace,
+            fields,
         })
     }
 }
 
-impl Parse for DataType {
+impl<A: TryParse, X: TryParse> Parse for ObjectType<A, X> {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut typ = if input.peek(syn::token::Brace) {
-            Self::Object(input.parse()?)
-        } else {
-            let ty = input.parse_as_ident()?;
-            match ty.to_string().as_str() {
-                "string" | "String" => Self::String(ty.span()),
-                "bool" | "boolean" => Self::Bool(ty.span()),
-                "int" => Self::Int(ty.span()),
-                "uint" => Self::Uint(ty.span()),
-                "float" => Self::Float(ty.span()),
-                _ => ty.to_syn_error("illegal config value type").to_err()?,
+        let inner: ParseBuffer;
+        let brace = syn::braced!(inner in input);
+        let mut fields: Vec<ObjectField<A, X>> = vec![];
+        while !inner.is_empty() {
+            if let Some(_) = inner.try_parse_comma() {
+                continue;
             }
-        };
+            let field: ObjectField<A, X> = inner.parse()?;
+            if let Some(prev) = fields.iter().find(|f| f.name.eq(&field.name)) {
+                (field.name.span(), prev.name.span())
+                    .to_span()
+                    .to_syn_error("duplicated field")
+                    .to_err()?;
+            }
+            fields.push(field);
+        }
+        Ok(Self { brace, fields })
+    }
+}
+impl<A: TryParse, X: TryParse> Type<A, X> {
+    fn parse_basic(input: ParseStream) -> syn::Result<Self> {
+        Ok(if input.peek(syn::token::Brace) {
+            Self::Object(input.parse()?)
+        } else if let Some(string) = StringType::try_parse(input)? {
+            Self::String(string)
+        } else if let Some(integer) = IntegerType::try_parse(input)? {
+            Self::Integer(integer)
+        } else if let Some(bool) = input.try_parse_as_ident("bool", false) {
+            Self::Bool(bool.span())
+        } else if let Some(json) = JsonStringType::try_parse(input)? {
+            Self::Json(json)
+        } else if let Some(object) = input.try_parse_as_ident("object", false) {
+            Self::Map(object.span())
+        } else if let Some(float) = FloatType::try_parse(input)? {
+            Self::Float(float)
+        } else if let Some(datetime) = DateTimeStringType::try_parse(input)? {
+            Self::Datetime(datetime)
+        } else if let Some(constant) = Constant::try_parse(input)? {
+            Self::Constant(constant)
+        } else {
+            input
+                .span()
+                .to_syn_error("illegal config value type")
+                .to_err()?
+        })
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            Self::Constant(c) => c.span(),
+            Self::String(s) => s.span,
+            Self::Bool(s) => *s,
+            Self::Integer(i) => i.token.span(),
+            Self::Float(f) => f.span,
+            Self::Object(o) => o.brace.span.close(),
+            Self::Datetime(d) => d.span,
+            Self::Json(j) => j.span,
+            Self::Map(s) => *s,
+            Self::List(l) => (l.element_type.span(), l.bracket.span.close()).to_span(),
+        }
+    }
+}
+
+impl<A: TryParse, X: TryParse> ParseType for Type<A, X> {
+    fn peek(input: ParseStream) -> syn::Result<()> {
+        if !input.peek(syn::token::Brace) {
+            input.parse::<Token![:]>()?;
+        }
+        Ok(())
+    }
+
+    fn parse_type(input: ParseStream) -> syn::Result<Self> {
+        let mut typ = Self::parse_basic(input)?;
         if input.peek(syn::token::Bracket) {
             let inner: ParseBuffer;
-            syn::bracketed!(inner in input);
+            let bracket = syn::bracketed!(inner in input);
             if inner.is_empty() {
-                typ = Self::List(Box::new(typ));
+                typ = Self::List(ListType {
+                    bracket,
+                    element_type: Box::new(typ),
+                });
             } else {
                 inner
                     .span()
@@ -442,80 +507,207 @@ impl Parse for DataType {
     }
 }
 
-impl Parse for ObjectType {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let inner: ParseBuffer;
-        syn::braced!(inner in input);
-        let mut fields: Vec<ObjectFieldType> = vec![];
-        while !inner.is_empty() {
-            if inner.peek(Token![,]) {
-                inner.parse::<Token![,]>()?;
-                continue;
-            }
-            let field: ObjectFieldType = inner.parse()?;
-            if !fields.is_empty() {
-                if fields.iter().find(|f| f.name.eq(&field.name)).is_some() {
-                    field.name.span().to_syn_error("duplicate key").to_err()?;
-                }
-            }
-            fields.push(field);
+impl StringType {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_one_of_idents(("string", "String", "str")) {
+            Ok(Some(Self { span: ident.span() }))
+        } else {
+            Ok(None)
         }
-        Ok(Self { fields })
     }
 }
 
-impl Parse for ObjectFieldType {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let name = input.parse_as_ident()?;
-        input.parse::<Token![:]>()?;
-        let ty: DataType = input.parse()?;
-        let default_value = if input.peek(Token![=]) {
-            input.parse::<Token![=]>()?;
-            Some(input.parse::<Value>()?)
+impl IntegerType {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(token) = input.try_parse_one_of_idents(("uint", "int", "integer")) {
+            Ok(Some(Self {
+                token,
+                limits: IntLimits::try_parse(input)?,
+            }))
         } else {
-            None
-        };
+            Ok(None)
+        }
+    }
+}
+
+impl IntLimits {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if input.peek(syn::token::Paren) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let limits = inner.parse_terminated(IntLimit::parse, Token![,])?;
+            // FIXME: validate limits
+            Ok(Some(Self { paren, limits }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Parse for IntLimit {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let res = input.fork_with_parsible::<ExprRange>();
+        Ok(if res.is_err() {
+            Self::Opt(input.parse()?)
+        } else {
+            Self::Range(res?)
+        })
+    }
+}
+
+impl FloatType {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(float) = input.try_parse_as_ident("float", false) {
+            Ok(Some(Self {
+                span: float.span(),
+                limits: FloatLimits::try_parse(input)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl FloatLimits {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if input.peek(syn::token::Paren) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let limits = inner.parse_terminated(ExprRange::parse, Token![,])?;
+            Ok(Some(Self { paren, limits }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<A: TryParse, X: TryParse> TryParse for JsonStringType<A, X> {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(json) = input.try_parse_as_ident("json", false) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            Ok(Some(Self {
+                paren,
+                span: json.span(),
+                typ: Box::new(Type::parse_type(&inner)?),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl DateTimeStringType {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_one_of_idents(("datetime", "date")) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let format = inner.parse::<LitStr>()?;
+            Ok(Some(Self {
+                paren,
+                span: ident.span(),
+                format,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<T: ParseType, A: TryParse, X: TryParse> Parse for Field<T, A, X> {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let name = input.parse_as_lit_str()?;
+        let optional = input.try_parse_question();
+        T::peek(input)?;
+        let typ = T::parse_type(input)?;
         Ok(Self {
             name,
-            value_type: ty,
-            value: default_value,
+            optional,
+            typ,
+            alias: A::try_parse(input)?,
+            expr: X::try_parse(input)?,
         })
     }
 }
 
-impl Parse for Value {
+impl Parse for Expr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        Ok(if let Some(_) = input.try_parse_dollar() {
-            Self::Var(input.parse()?)
-        } else if input.peek(LitStr) {
-            Self::String(input.parse()?)
-        } else if input.peek(LitInt) {
-            Self::Int(input.parse()?)
-        } else if input.peek(LitFloat) {
-            Self::Float(input.parse()?)
-        } else if input.peek(LitBool) {
-            Self::Bool(input.parse()?)
-        } else if input.peek(syn::token::Brace) {
-            Self::Object(input.parse()?)
-        } else if input.peek(syn::token::Bracket) {
-            Self::Array(input.parse()?)
+        let expr = if let Some(dollar) = input.try_parse_dollar() {
+            let variable = Variable::continue_to_parse(input, dollar)?;
+            if input.peek(Token![||]) {
+                Self::Or(OrExpr::parse(input, variable)?)
+            } else {
+                Self::Variable(variable)
+            }
+        } else if let Some(string) = JsonStringifyFn::try_parse(input)? {
+            Self::Json(string)
+        } else if let Some(string) = DatetimeFn::try_parse(input)? {
+            Self::Datetime(string)
+        } else if let Some(string) = FormatFn::try_parse(input)? {
+            Self::Format(string)
+        } else if let Some(string) = JoinStringFn::try_parse(input)? {
+            Self::Join(string)
+        } else if let Some(uint) = UnixTimestampUintFn::try_parse(input)? {
+            Self::Timestamp(uint)
         } else {
-            input.span().to_syn_error("missing constant").to_err()?
-        })
+            Self::Constant(input.parse()?)
+        };
+        Ok(expr)
     }
 }
 
-impl Parse for ObjectValue {
+impl Parse for Constant {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if let Some(constant) = Self::try_parse(input)? {
+            Ok(constant)
+        } else {
+            input.span().to_syn_error("missing constant").to_err()
+        }
+    }
+}
+
+impl Constant {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        Ok(if input.peek(LitStr) {
+            Some(Self::String(input.parse()?))
+        } else if input.peek(syn::LitInt) {
+            Some(Self::Int(input.parse()?))
+        } else if input.peek(syn::LitFloat) {
+            Some(Self::Float(input.parse()?))
+        } else if input.peek(syn::LitBool) {
+            Some(Self::Bool(input.parse()?))
+        } else if input.peek(syn::token::Brace) {
+            Some(Self::Object(input.parse()?))
+        } else if input.peek(syn::token::Bracket) {
+            Some(Self::Array(input.parse()?))
+        } else {
+            None
+        })
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            Constant::String(s) => s.span(),
+            Constant::Bool(b) => b.span(),
+            Constant::Int(i) => i.span(),
+            Constant::Float(f) => f.span(),
+            Constant::Object(o) => o.span(),
+            Constant::Array(a) => a.span(),
+        }
+    }
+}
+
+impl Parse for ObjectConstant {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let brace = syn::braced!(inner in input);
-        let mut fields: Vec<ObjectFieldValue> = vec![];
+        let mut fields: Vec<ObjectConstantField> = vec![];
         while !inner.is_empty() {
             if inner.peek(Token![,]) {
                 inner.parse::<Token![,]>()?;
                 continue;
             }
-            let field: ObjectFieldValue = inner.parse()?;
+            let field: ObjectConstantField = inner.parse()?;
             if !fields.is_empty() {
                 if fields.iter().find(|f| f.name.eq(&field.name)).is_some() {
                     field.name.span().to_syn_error("duplicated key").to_err()?;
@@ -530,7 +722,13 @@ impl Parse for ObjectValue {
     }
 }
 
-impl Parse for ArrayValue {
+impl ObjectConstant {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl Parse for ConstantArray {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let bracket = syn::bracketed!(inner in input);
@@ -549,11 +747,153 @@ impl Parse for ArrayValue {
     }
 }
 
-impl Parse for ObjectFieldValue {
+impl ConstantArray {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl Parse for ObjectConstantField {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![:]>()?;
         let value = input.parse()?;
         Ok(Self { name, value })
+    }
+}
+
+impl Variable {
+    fn continue_to_parse(input: ParseStream, dollar: Token![$]) -> syn::Result<Self> {
+        let name = input.parse()?;
+        Ok(if input.peek(Token![:]) {
+            Type::<(), ()>::peek(input)?;
+            Self {
+                dollar: dollar.span,
+                name,
+                typ: Some(Type::parse_type(input)?),
+            }
+        } else {
+            Self {
+                dollar: dollar.span,
+                name,
+                typ: None,
+            }
+        })
+    }
+}
+
+impl Parse for Variable {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let dollar = input.parse()?;
+        Self::continue_to_parse(input, dollar)
+    }
+}
+
+impl OrExpr {
+    fn parse(input: ParseStream, variable: Variable) -> syn::Result<Self> {
+        let or = input.parse::<Token![||]>()?;
+        Ok(Self {
+            variable,
+            or,
+            default: input.parse()?,
+        })
+    }
+}
+
+impl FormatFn {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_one_of_idents(("format", "fmt")) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let format_text = inner.parse::<LitStr>()?;
+            let args = if let Some(_comma) = inner.try_parse_comma() {
+                Some(inner.parse_terminated(Expr::parse, Token![,])?)
+            } else {
+                None
+            };
+            Ok(Some(Self {
+                fn_token: ident.span(),
+                paren,
+                format_text,
+                args,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl JsonStringifyFn {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(json) = input.try_parse_as_ident("json", false) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let variable = inner.parse()?;
+            Ok(Some(Self {
+                fn_token: json.span(),
+                paren,
+                variable,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl DatetimeFn {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_one_of_idents(("datetime", "date")) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let variable = Variable::parse(&inner)?;
+            inner.parse::<Token![,]>()?;
+            let format = inner.parse::<LitStr>()?;
+            // FIXME: validate format
+            Ok(Some(Self {
+                token: ident.span(),
+                paren,
+                variable,
+                format,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl JoinStringFn {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_one_of_idents(("join_string", "join")) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let variable = Variable::parse(&inner)?;
+            inner.parse::<Token![,]>()?;
+            let sep = inner.parse::<LitStr>()?;
+            Ok(Some(Self {
+                token: ident.span(),
+                paren,
+                variable,
+                sep,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl UnixTimestampUintFn {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_as_ident("timestamp", false) {
+            let inner: ParseBuffer;
+            let paren = syn::parenthesized!(inner in input);
+            let variable = Variable::parse(&inner)?;
+            Ok(Some(Self {
+                token: ident.span(),
+                paren,
+                variable,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
