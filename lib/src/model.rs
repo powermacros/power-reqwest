@@ -11,7 +11,6 @@ pub type ClientParams = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=]
 #[derive(Clone)]
 pub struct Client {
     pub name: Ident,
-    pub options_name: Option<Ident>,
     pub options: Option<ClientParams>,
     pub hooks: Option<Hooks>,
     pub auth: Option<Auth>,
@@ -266,6 +265,7 @@ pub struct DateTimeStringType {
     pub span: Span,
     pub paren: Paren,
     pub format: LitStr,
+    pub formatter: syn::Path,
 }
 
 #[derive(Clone)]

@@ -20,7 +20,6 @@ impl Parse for Client {
         let whole_span = input.span();
         let mut client = Self {
             name: Ident::new("_", whole_span),
-            options_name: None,
             options: None,
             hooks: None,
             auth: None,
@@ -90,8 +89,9 @@ impl Parse for Client {
                     .to_err()?;
             }
         }
-        if client.options.is_some() {
-            client.options_name = Some(client.name.with_suffix("Options"));
+
+        if let Some(options) = client.options.as_mut() {
+            options.struct_name = client.name.with_suffix("Options");
         }
         client.resolve_object_type_names()?;
         Ok(client)
@@ -476,6 +476,9 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X>
                         obj.resolve_type_name(&self.field_name, prefix, true)?;
                     }
                 }
+                Type::DatetimeString(DateTimeStringType { formatter, .. }) => {
+                    // FIXME: set formatter mod name
+                }
                 _ => {}
             }
         }
@@ -488,7 +491,7 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
         &mut self,
         field_name: &Ident,
         prefix: &str,
-        is_list_item: bool,
+        _is_list_item: bool,
     ) -> syn::Result<()> {
         self.struct_name = field_name
             .to_ident_with_case(Case::UpperCamel)
@@ -754,6 +757,7 @@ impl DateTimeStringType {
                 paren,
                 span: ident.span(),
                 format,
+                formatter: syn::Path::new(),
             }))
         } else {
             Ok(None)
@@ -764,13 +768,19 @@ impl DateTimeStringType {
 impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Parse for Field<T, A, X> {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let name = input.parse_as_lit_str()?;
+
         let optional = input.try_parse_question();
         T::peek(input)?;
         let typ = T::parse_type(input)?;
         let alias = A::try_parse(input)?;
         let expr = X::try_parse(input)?;
-        let field_name = if let Some(alias) = &alias {
+        let mut field_name = if let Some(alias) = &alias {
             if let Some(alias) = alias.as_alias() {
+                if alias.is_keyword() {
+                    alias
+                        .to_syn_error("alias name is reserved for rust language")
+                        .to_err()?;
+                }
                 alias.clone()
             } else {
                 name.to_ident_with_case(Case::Snake)
@@ -778,6 +788,19 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Parse for Fiel
         } else {
             name.to_ident_with_case(Case::Snake)
         };
+
+        match field_name.to_string().as_str() {
+            "type" => {
+                field_name = ("typ", field_name.span()).to_ident();
+            }
+            x @ _ => {
+                if is_keyword(x) {
+                    field_name =
+                        (format!("{}_", field_name.to_string()), field_name.span()).to_ident();
+                }
+            }
+        }
+
         let mut default = None;
         if let Some(Type::Constant(c)) = typ.as_type() {
             default = Some(c.to_value());
@@ -961,7 +984,12 @@ impl Constant {
             Constant::Bool(c) => c.to_expr(),
             Constant::Int(c) => c.to_expr(),
             Constant::Float(c) => c.to_expr(),
-            Constant::Object(c) => todo!(),
+            Constant::Object(c) => syn::Expr::Call(syn::ExprCall {
+                attrs: vec![],
+                func: Box::new(syn::Path::from_idents(("Default", "default", c.span)).to_expr()),
+                paren_token: Paren(c.span),
+                args: Punctuated::new(),
+            }),
             Constant::Array(c) => c
                 .elements
                 .iter()
@@ -1212,5 +1240,33 @@ impl UnixTimestampUintFn {
 impl ToSpan for UnixTimestampUintFn {
     fn to_span(&self) -> Span {
         (self.token, self.paren.span.close()).to_span()
+    }
+}
+
+pub trait IsKeyword {
+    fn is_keyword(&self) -> bool;
+}
+
+impl IsKeyword for Ident {
+    fn is_keyword(&self) -> bool {
+        is_keyword(&self.to_string())
+    }
+}
+
+impl IsKeyword for LitStr {
+    fn is_keyword(&self) -> bool {
+        is_keyword(&self.value())
+    }
+}
+
+fn is_keyword(ident: &str) -> bool {
+    match ident {
+        "type" | "abstract" | "as" | "async" | "auto" | "await" | "become" | "box" | "break"
+        | "const" | "continue" | "crate" | "default" | "do" | "dyn" | "else" | "enum"
+        | "extern" | "final" | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "macro"
+        | "match" | "mod" | "move" | "mut" | "override" | "priv" | "pub" | "ref" | "return"
+        | "static" | "struct" | "super" | "trait" | "try" | "typeof" | "union" | "unsafe"
+        | "unsized" | "use" | "virtual" | "where" | "while" | "yield" => true,
+        _ => false,
     }
 }

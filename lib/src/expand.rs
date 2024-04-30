@@ -1,30 +1,29 @@
 use crate::*;
 use proc_macro2::TokenStream;
 use quote::{quote, ToTokens, TokenStreamExt};
-use syn::{spanned::Spanned, Ident, LitInt, Path};
-use syn_prelude::{PathHelpers, ToIdent, WithPrefix};
+use syn::{spanned::Spanned, Ident, Path};
+use syn_prelude::{PathHelpers, ToIdent};
 
 impl ToTokens for Client {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        let Self {
-            name,
-            options_name,
-            apis,
-            ..
-        } = self;
-        let params = self
+        let Self { name, apis, .. } = self;
+        let param_types = self
             .options
             .as_ref()
-            .map(|params| params.to_client_params_tokens(options_name));
+            .map(|params| params.gen_obj_structs())
+            .unwrap_or(vec![]);
 
-        let options_arg = options_name.as_ref().map(|typ| quote! (options: #typ));
+        let options_arg = self
+            .options
+            .as_ref()
+            .map(|BracedConfig { struct_name, .. }| quote! (options: #struct_name));
         let options_field = options_arg.as_ref().map(|arg| quote!(#arg,));
         let options_assign = options_arg.as_ref().map(|_| quote!(options,));
 
         let api_decls = apis.iter().map(|api| api.to_token_stream(self));
 
         tokens.append_all(quote! {
-            #params
+            #(#param_types)*
 
             pub struct #name {
                 #options_field
@@ -42,93 +41,6 @@ impl ToTokens for Client {
 
             #(#api_decls)*
         })
-    }
-}
-
-impl ClientParams {
-    fn to_client_params_tokens(&self, options_name: &Option<Ident>) -> TokenStream {
-        let fields = self.fields.iter().map(
-            |Field {
-                 field_name,
-                 optional,
-                 typ,
-                 ..
-             }| {
-                let mut typ = typ.to_type();
-                if optional.is_some() {
-                    let mut option = syn::Path::from_ident(("Option", typ.span()));
-                    option.push_arg(0, typ);
-                    typ = option.to_type();
-                }
-                quote! {
-                    #field_name: #typ
-                }
-            },
-        );
-
-        let field_default_inits = self.fields.iter().map(
-            |Field {
-                 field_name,
-                 optional,
-                 typ,
-                 expr,
-                 ..
-             }| {
-                let mut init_value = if let Some((_, Expr::Constant(constant))) = expr {
-                    constant.to_token_stream()
-                } else {
-                    typ.default_expr()
-                };
-                if optional.is_some() {
-                    init_value = quote!(Some(#init_value));
-                }
-                quote! {#field_name: #init_value}
-            },
-        );
-
-        let field_methods = self.fields.iter().map(
-            |Field {
-                 field_name,
-                 typ,
-                 optional,
-                 ..
-             }| {
-                let set_fn = field_name.with_prefix("set_");
-                let arg_typ = typ.to_type();
-                let value = if optional.is_some() {
-                    quote! {Some(value)}
-                } else {
-                    quote!(value)
-                };
-                quote! {
-                    pub fn #set_fn(&mut self, value: #arg_typ) -> &mut Self {
-                        self.#field_name = #value;
-                        self
-                    }
-                }
-            },
-        );
-
-        quote! {
-            #[derive(Debug, Clone)]
-            pub struct #options_name {
-                #(#fields),*
-            }
-
-            impl Default for #options_name {
-                fn default() -> Self {
-                    Self{
-                        #(#field_default_inits),*
-                    }
-                }
-            }
-
-            impl #options_name {
-                #(
-                    #field_methods
-                )*
-            }
-        }
     }
 }
 
@@ -162,42 +74,18 @@ impl<A: AsFieldAlias, X: TryParse> Type<A, X> {
                 path.to_type()
             }
             Self::JsonText(j) => Path::from_ident(("String", j.span)).to_type(),
-            Self::Map(_) => todo!(),
+            Self::Map(span) => {
+                let mut map = syn::Path::from_idents(("serde_json", "Map", *span));
+                map.push_ident_arg(1, ("String", *span).to_ident());
+                let value = syn::Path::from_idents(("serde_json", "Value", *span));
+                map.push_arg(1, value.to_type());
+                map.to_type()
+            }
             Self::List(l) => {
                 let mut path = Path::from_ident(("Vec", l.bracket.span.close()));
                 path.push_arg(0, l.element_type.to_type());
                 path.to_type()
             }
-        }
-    }
-
-    fn default_expr(&self) -> TokenStream {
-        match self {
-            Self::Constant(constant) => quote!(#constant),
-            Self::String(_) => quote!("".to_owned()),
-            Self::Bool(_) => quote!("false"),
-            Self::Integer(i) => {
-                if i.token.eq("uint") {
-                    quote!(0u64)
-                } else if i.token.eq("int") || i.token.eq("integer") {
-                    quote!(0i64)
-                } else {
-                    LitInt::new(&format!("0{}", i.token.to_string()), i.token.span())
-                        .to_token_stream()
-                }
-            }
-            Self::Float(f) => {
-                if f.token.eq("f32") {
-                    quote!(0f32)
-                } else {
-                    quote!(0f64)
-                }
-            }
-            Self::Object(_) => todo!(),
-            Self::DatetimeString(_) => quote!("".to_owned()),
-            Self::JsonText(_) => quote!("".to_owned()),
-            Self::Map(_) => todo!(),
-            Self::List(_) => quote!(vec![]),
         }
     }
 }
@@ -209,7 +97,9 @@ impl Constant {
             Self::Bool(value) => Path::from_ident(("bool", value.span())).to_type(),
             Self::Int(value) => Path::from_ident(("u64", value.span())).to_type(),
             Self::Float(value) => Path::from_ident(("f64", value.span())).to_type(),
-            Self::Object(_value) => todo!(),
+            Self::Object(_obj) => {
+                todo!("not support object constant yet")
+            }
             Self::Array(arr) => {
                 let el = arr.elements.first().unwrap();
                 let mut path = Path::from_ident(("Vec", arr.span));
@@ -246,30 +136,30 @@ impl Api {
         } = self;
 
         let mut types = if let Some(json) = &request.json {
-            json.to_types()
+            json.gen_obj_structs()
         } else if let Some(form) = &request.form {
-            form.to_types()
+            form.gen_obj_structs()
         } else {
             vec![]
         };
         if let Some(queries) = &request.query {
-            types.extend(queries.to_types());
+            types.extend(queries.gen_obj_structs());
         }
         if let Some(headers) = &request.header {
-            types.extend(headers.to_types());
+            types.extend(headers.gen_obj_structs());
         }
 
         if let Some(response) = response {
             if let Some(json) = &response.json {
-                types.extend(json.to_types());
+                types.extend(json.gen_obj_structs());
             } else if let Some(form) = &response.form {
-                types.extend(form.to_types());
+                types.extend(form.gen_obj_structs());
             }
             if let Some(cookies) = &response.cookie {
-                types.extend(cookies.to_types());
+                types.extend(cookies.gen_obj_structs());
             }
             if let Some(headers) = &response.header {
-                types.extend(headers.to_types());
+                types.extend(headers.gen_obj_structs());
             }
         }
 
@@ -297,18 +187,29 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
              typ,
              ..
          }| {
-            let mut typ = if let Some(typ) = typ.as_type() {
+            let mut field_type = if let Some(typ) = typ.as_type() {
                 typ.to_type()
             } else {
                 syn::Path::from_ident(("String", name.span())).to_type()
             };
             if optional.is_some() {
-                let mut option = syn::Path::from_ident(("Option", typ.span()));
-                option.push_arg(0, typ);
-                typ = option.to_type()
+                let mut option = syn::Path::from_ident(("Option", field_type.span()));
+                option.push_arg(0, field_type);
+                field_type = option.to_type()
             }
+            let serde = if !name.value().eq(&field_name.to_string()) {
+                Some(quote! {#[serde(rename = #name)]})
+            } else if let Some(Type::DatetimeString(DateTimeStringType { formatter, .. })) =
+                typ.as_type()
+            {
+                // Some(quote! {#[serde(with = #formatter)]})
+                None
+            } else {
+                None
+            };
             quote! {
-                #field_name: #typ
+                #serde
+                pub #field_name: #field_type
             }
         },
     );
@@ -330,6 +231,7 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
     );
 
     quote! {
+        #[derive(serde::Serialize, serde::Deserialize)]
         pub struct #name {
             #(#fields_in_struct),*
         }
@@ -344,13 +246,13 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
 }
 
 impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T, A, X> {
-    fn to_types(&self) -> Vec<TokenStream> {
+    fn gen_obj_structs(&self) -> Vec<TokenStream> {
         let mut types = self
             .fields
             .iter()
             .filter_map(|f| {
-                if let Some(Type::Object(obj)) = f.typ.as_type() {
-                    Some(obj.to_types())
+                if let Some(typ) = f.typ.as_type() {
+                    typ.gen_obj_structs()
                 } else {
                     None
                 }
@@ -358,22 +260,34 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T
             .flatten()
             .collect::<Vec<_>>();
         types.insert(0, make_object_struct(&self.struct_name, &self.fields));
+
         types
     }
 }
 
-impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
-    fn to_types(&self) -> Vec<TokenStream> {
-        let mut types = self
-            .fields
-            .iter()
-            .filter_map(|f| {
-                if let Type::Object(obj) = &f.typ {
-                    Some(obj.to_types())
+impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
+    fn gen_obj_structs(&self) -> Option<Vec<TokenStream>> {
+        match self {
+            Self::Object(obj) => Some(obj.gen_obj_structs()),
+            Self::JsonText(JsonStringType { typ, .. }) => {
+                if let Type::Object(obj) = typ.as_ref() {
+                    Some(obj.gen_obj_structs())
                 } else {
                     None
                 }
-            })
+            }
+            Self::List(ListType { element_type, .. }) => element_type.gen_obj_structs(),
+            _ => None,
+        }
+    }
+}
+
+impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
+    fn gen_obj_structs(&self) -> Vec<TokenStream> {
+        let mut types = self
+            .fields
+            .iter()
+            .filter_map(|f| f.typ.gen_obj_structs())
             .flatten()
             .collect::<Vec<_>>();
         types.insert(0, make_object_struct(&self.struct_name, &self.fields));
