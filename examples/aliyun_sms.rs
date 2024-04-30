@@ -1,4 +1,7 @@
 use power_reqwest::reqwest;
+
+fn patch_before_submit() {}
+
 reqwest! {
     name: AliyunSmsClient,
     params: {
@@ -651,7 +654,7 @@ reqwest! {
             Action: "SmsConversionIntl",
             MessageId: string = $message_id,
             Delivered: bool = $delivered,
-            ConversionTime?: uint = $conversion_time
+            ConversionTime?: uint = timestamp($conversion_time)
         }
     } -> {
         json: {
@@ -666,7 +669,7 @@ reqwest! {
     post conversion_data_intl("https://$api.aliyuncs.com") {
         form {
             Action: "ConversionDataIntl",
-            ReportTime?: uint = $report_time,
+            ReportTime?: uint = timestamp($report_time),
             ConversionRate: string = format("{}", $conversion_rate: float)
         }
     } -> {

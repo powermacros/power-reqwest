@@ -4,7 +4,10 @@ use quote::ToTokens;
 #[proc_macro]
 pub fn reqwest(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     match syn::parse::<Client>(input) {
-        Ok(client) => client.to_token_stream().into(),
+        Ok(client) => {
+            // std::fs::write("examples/x.rs", client.to_token_stream().to_string());
+            client.to_token_stream().into()
+        }
         Err(err) => err.to_compile_error().into(),
     }
 }

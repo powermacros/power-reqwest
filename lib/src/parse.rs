@@ -1,11 +1,16 @@
+use convert_case::{Case, Casing};
 use proc_macro2::Span;
 use syn::{
     parse::{Parse, ParseBuffer, ParseStream},
+    punctuated::Punctuated,
+    spanned::Spanned,
+    token::Paren,
     ExprRange, Ident, LitStr, Token,
 };
 use syn_prelude::{
-    ForkWithParsible, ParseAsIdent, ParseAsLitStr, ToErr, ToSpan, ToSynError, TryParseAsIdent,
-    TryParseOneOfIdents, TryParseTokens,
+    ForkWithParsible, ParseAsIdent, ParseAsLitStr, PathHelpers, ToErr, ToExpr, ToIdent,
+    ToIdentWithCase, ToSpan, ToSynError, TryParseAsIdent, TryParseOneOfIdents, TryParseTokens,
+    WithPrefix, WithSuffix,
 };
 
 use crate::model::*;
@@ -13,102 +18,117 @@ use crate::model::*;
 impl Parse for Client {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let whole_span = input.span();
-        let mut client_name = None;
-        let mut params = None;
-        let mut signing = None;
-        let mut auth = None;
-        let mut common = None;
-        let mut api_list = vec![];
+        let mut client = Self {
+            name: Ident::new("_", whole_span),
+            options_name: None,
+            options: None,
+            hooks: None,
+            auth: None,
+            signing: None,
+            apis: vec![],
+        };
         while !input.is_empty() {
             if input.try_parse_comma().is_some() || input.try_parse_semi().is_some() {
                 continue;
             }
 
-            let decl: ClientDecl = input.parse()?;
-            match decl {
-                ClientDecl::Name(_token, name) => {
-                    if client_name.is_some() {
-                        name.to_syn_error("duplicate client name defined previously")
-                            .to_err()?;
-                    }
-                    client_name = Some(name);
+            if let Some(api) = Api::try_parse(input)? {
+                client.apis.push(api);
+            } else if let Some(_ident) = input.try_parse_as_ident("name", true) {
+                input.parse::<Token![:]>()?;
+                let name: Ident = input.parse()?;
+                if !name.to_string().is_case(Case::UpperCamel) {
+                    name.to_syn_error("expect 'UpperCamel' case name")
+                        .to_err()?;
                 }
-                ClientDecl::Params(decl) => {
-                    if params.is_some() {
-                        decl.token
-                            .to_syn_error("duplicate client config defined previously")
-                            .to_err()?;
-                    }
-                    params = Some(decl);
+                client.name = name;
+            } else if let Some(ident) = input.try_parse_one_of_idents(("params", "options")) {
+                if let Some(params) = &client.options {
+                    (ident.span(), params.token)
+                        .to_span()
+                        .to_syn_error("duplicated client params(options) config")
+                        .to_err()?;
                 }
-                ClientDecl::Signature(decl) => {
-                    if signing.is_some() {
-                        decl.span
-                            .to_syn_error("duplicate signature/signing config defined previously")
-                            .to_err()?;
-                    }
-                    signing = Some(decl);
+                input.try_parse_colon();
+                let params = ClientParams::parse(input, ident.span())?;
+                for field in params.fields.iter() {
+                    field.requires_to_simple_type()?;
+                    field.check_constant_expr_with_type()?;
                 }
-                ClientDecl::Auth(decl) => {
-                    if auth.is_some() {
-                        decl.span
-                            .to_syn_error("duplicate authorization config defined previously")
-                            .to_err()?;
-                    }
-                    auth = Some(decl);
+                client.options = Some(params);
+            } else if let Some(signing) = Signing::try_parse(input)? {
+                if let Some(prev) = &client.signing {
+                    (signing.span, prev.span)
+                        .to_span()
+                        .to_syn_error("duplicated signature config")
+                        .to_err()?;
                 }
-                ClientDecl::Api(decl) => {
-                    api_list.push(decl);
+                input.try_parse_colon();
+                client.signing = Some(signing);
+            } else if let Some(auth) = Auth::try_parse(input)? {
+                if let Some(prev) = &client.auth {
+                    (auth.span, prev.span)
+                        .to_span()
+                        .to_syn_error("duplicated authorization config")
+                        .to_err()?;
                 }
-                ClientDecl::Common(decl) => {
-                    if common.is_some() {
-                        decl.span
-                            .to_syn_error("duplicate common config defined previously")
-                            .to_err()?;
-                    }
-                    common = Some(decl);
+                input.try_parse_colon();
+                client.auth = Some(auth);
+            } else if let Some(hooks) = Hooks::try_parse(input)? {
+                if let Some(prev) = &client.hooks {
+                    (hooks.span, prev.span)
+                        .to_span()
+                        .to_syn_error("duplicated hooks config")
+                        .to_err()?;
                 }
+                input.try_parse_colon();
+                client.hooks = Some(hooks);
+            } else {
+                input
+                    .span()
+                    .to_syn_error("unexpect config field")
+                    .to_err()?;
             }
         }
-        Ok(Self {
-            name: client_name.ok_or(whole_span.to_syn_error("missing client name!"))?,
-            params,
-            hooks: common,
-            auth,
-            signing,
-            apis: api_list,
-        })
+        if client.options.is_some() {
+            client.options_name = Some(client.name.with_suffix("Options"));
+        }
+        client.resolve_object_type_names()?;
+        Ok(client)
     }
 }
 
-enum ClientDecl {
-    Name(Ident, Ident),
-    Params(ClientParams),
-    Signature(Signing),
-    Auth(Auth),
-    Api(Api),
-    Common(Hooks),
-}
+impl Client {
+    fn resolve_object_type_names(&mut self) -> syn::Result<()> {
+        for api in self.apis.iter_mut() {
+            let prefix = api.name.to_ident_with_case(Case::UpperCamel);
+            if let Some(json) = &mut api.request.json {
+                json.resolve_types(prefix.with_suffix("RequestData"))?;
+            } else if let Some(form) = &mut api.request.form {
+                form.resolve_types(prefix.with_suffix("RequestData"))?;
+            };
+            if let Some(headers) = &mut api.request.header {
+                headers.resolve_types(prefix.with_suffix("RequestHeaders"))?;
+            };
+            if let Some(query) = &mut api.request.query {
+                query.resolve_types(prefix.with_suffix("Query"))?;
+            };
 
-impl Parse for ClientDecl {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        if let Some(api) = Api::try_parse(input)? {
-            Ok(Self::Api(api))
-        } else if let Some(ident) = input.try_parse_as_ident("name", true) {
-            input.parse::<Token![:]>()?;
-            Ok(Self::Name(ident, input.parse()?))
-        } else if let Some(ident) = input.try_parse_as_ident("params", false) {
-            input.try_parse_colon();
-            Ok(Self::Params(ClientParams::parse(input, ident.span())?))
-        } else if let Some(signing) = Signing::try_parse(input)? {
-            Ok(Self::Signature(signing))
-        } else if let Some(auth) = Auth::try_parse(input)? {
-            Ok(Self::Auth(auth))
-        } else if let Some(common) = Hooks::try_parse(input)? {
-            Ok(Self::Common(common))
-        } else {
-            input.span().to_syn_error("unexpect config field").to_err()
+            if let Some(response) = &mut api.response {
+                if let Some(json) = &mut response.json {
+                    json.resolve_types(prefix.with_suffix("ResponseData"))?;
+                } else if let Some(form) = &mut response.form {
+                    form.resolve_types(prefix.with_suffix("ResponseData"))?;
+                }
+                if let Some(headers) = &mut response.header {
+                    headers.resolve_types(prefix.with_suffix("ResponseHeaders"))?;
+                }
+                if let Some(cookies) = &mut response.cookie {
+                    cookies.resolve_types(prefix.with_suffix("ResponseCookies"))?;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -225,9 +245,13 @@ impl Api {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
         if let Some(method) = input.try_parse_one_of_idents(("get", "post", "put", "delete")) {
             let name = input.parse_as_ident()?;
+            if !name.to_string().is_case(Case::Snake) {
+                name.to_syn_error("method for client expects normal snake-case name")
+                    .to_err()?;
+            }
             let url_input: ParseBuffer;
             let paren = syn::parenthesized!(url_input in input);
-            let url: LitStr = url_input.parse()?;
+            let uri: LitStr = url_input.parse()?;
             if !url_input.is_empty() {
                 url_input
                     .span()
@@ -247,7 +271,17 @@ impl Api {
                 method,
                 name,
                 paren,
-                url,
+                uri: ApiUri {
+                    uri,
+                    schema: None,
+                    user: None,
+                    passwd: None,
+                    host: None,
+                    port: None,
+                    uri_path: None,
+                    uri_query: None,
+                    fragment: None,
+                },
                 request,
                 response,
             }))
@@ -387,7 +421,7 @@ impl Parse for ApiResponse {
     }
 }
 
-impl<T: ParseType, A: TryParse, X: TryParse> BracedConfig<T, A, X> {
+impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T, A, X> {
     fn parse(input: ParseStream, token: Span) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let brace = syn::braced!(inner in input);
@@ -397,7 +431,7 @@ impl<T: ParseType, A: TryParse, X: TryParse> BracedConfig<T, A, X> {
                 continue;
             }
             let field: Field<T, A, X> = inner.parse()?;
-            if let Some(prev) = fields.iter().find(|f| f.name.eq(&field.name)) {
+            if let Some(prev) = fields.iter().find(|f| f.field_name.eq(&field.field_name)) {
                 (field.name.span(), prev.name.span())
                     .to_span()
                     .to_syn_error("duplicated field")
@@ -407,13 +441,67 @@ impl<T: ParseType, A: TryParse, X: TryParse> BracedConfig<T, A, X> {
         }
         Ok(Self {
             token,
+            struct_name: ("_", token).to_ident(),
             brace,
             fields,
         })
     }
 }
 
-impl<A: TryParse, X: TryParse> Parse for ObjectType<A, X> {
+impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T, A, X> {
+    fn resolve_types(&mut self, name: Ident) -> syn::Result<()> {
+        let prefix = name.to_string();
+        self.struct_name = name.clone();
+        for field in self.fields.iter_mut() {
+            field.resolve_field_type(&prefix)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X> {
+    fn resolve_field_type(&mut self, prefix: &str) -> syn::Result<()> {
+        if let Some(typ) = self.typ.as_type_mut() {
+            match typ {
+                Type::Object(obj) => {
+                    obj.resolve_type_name(&self.field_name, prefix, false)?;
+                }
+                Type::JsonText(JsonStringType { typ, .. }) => {
+                    if let Some(Type::Object(obj)) = typ.as_type_mut() {
+                        obj.resolve_type_name(&self.field_name, prefix, false)?;
+                    }
+                }
+                Type::List(ListType { element_type, .. }) => {
+                    if let Type::Object(obj) = element_type.as_mut() {
+                        obj.resolve_type_name(&self.field_name, prefix, true)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
+    fn resolve_type_name(
+        &mut self,
+        field_name: &Ident,
+        prefix: &str,
+        is_list_item: bool,
+    ) -> syn::Result<()> {
+        self.struct_name = field_name
+            .to_ident_with_case(Case::UpperCamel)
+            .with_prefix(prefix);
+        let obj_name = self.struct_name.to_string();
+        for child in self.fields.iter_mut() {
+            child.resolve_field_type(&obj_name)?;
+        }
+        Ok(())
+    }
+}
+
+impl<A: AsFieldAlias, X: AsFieldAssignment> Parse for ObjectType<A, X> {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let brace = syn::braced!(inner in input);
@@ -431,10 +519,14 @@ impl<A: TryParse, X: TryParse> Parse for ObjectType<A, X> {
             }
             fields.push(field);
         }
-        Ok(Self { brace, fields })
+        Ok(Self {
+            struct_name: Ident::new("_", brace.span.close()),
+            brace,
+            fields,
+        })
     }
 }
-impl<A: TryParse, X: TryParse> Type<A, X> {
+impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
     fn parse_basic(input: ParseStream) -> syn::Result<Self> {
         Ok(if input.peek(syn::token::Brace) {
             Self::Object(input.parse()?)
@@ -445,13 +537,13 @@ impl<A: TryParse, X: TryParse> Type<A, X> {
         } else if let Some(bool) = input.try_parse_as_ident("bool", false) {
             Self::Bool(bool.span())
         } else if let Some(json) = JsonStringType::try_parse(input)? {
-            Self::Json(json)
+            Self::JsonText(json)
         } else if let Some(object) = input.try_parse_as_ident("object", false) {
             Self::Map(object.span())
         } else if let Some(float) = FloatType::try_parse(input)? {
             Self::Float(float)
         } else if let Some(datetime) = DateTimeStringType::try_parse(input)? {
-            Self::Datetime(datetime)
+            Self::DatetimeString(datetime)
         } else if let Some(constant) = Constant::try_parse(input)? {
             Self::Constant(constant)
         } else {
@@ -461,24 +553,26 @@ impl<A: TryParse, X: TryParse> Type<A, X> {
                 .to_err()?
         })
     }
+}
 
-    fn span(&self) -> Span {
+impl<A, X> ToSpan for Type<A, X> {
+    fn to_span(&self) -> Span {
         match self {
             Self::Constant(c) => c.span(),
             Self::String(s) => s.span,
             Self::Bool(s) => *s,
             Self::Integer(i) => i.token.span(),
-            Self::Float(f) => f.span,
+            Self::Float(f) => f.token.span(),
             Self::Object(o) => o.brace.span.close(),
-            Self::Datetime(d) => d.span,
-            Self::Json(j) => j.span,
+            Self::DatetimeString(d) => d.span,
+            Self::JsonText(j) => j.span,
             Self::Map(s) => *s,
-            Self::List(l) => (l.element_type.span(), l.bracket.span.close()).to_span(),
+            Self::List(l) => (l.element_type.to_span(), l.bracket.span.close()).to_span(),
         }
     }
 }
 
-impl<A: TryParse, X: TryParse> ParseType for Type<A, X> {
+impl<A: AsFieldAlias, X: AsFieldAssignment> AsFieldType<A, X> for Type<A, X> {
     fn peek(input: ParseStream) -> syn::Result<()> {
         if !input.peek(syn::token::Brace) {
             input.parse::<Token![:]>()?;
@@ -505,6 +599,14 @@ impl<A: TryParse, X: TryParse> ParseType for Type<A, X> {
         }
         Ok(typ)
     }
+
+    fn as_type(&self) -> Option<&Type<A, X>> {
+        Some(self)
+    }
+
+    fn as_type_mut(&mut self) -> Option<&mut Type<A, X>> {
+        Some(self)
+    }
 }
 
 impl StringType {
@@ -519,7 +621,10 @@ impl StringType {
 
 impl IntegerType {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(token) = input.try_parse_one_of_idents(("uint", "int", "integer")) {
+        if let Some(token) = input.try_parse_one_of_idents((
+            "uint", "int", "integer", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64",
+            "usize", "isize",
+        )) {
             Ok(Some(Self {
                 token,
                 limits: IntLimits::try_parse(input)?,
@@ -527,6 +632,10 @@ impl IntegerType {
         } else {
             Ok(None)
         }
+    }
+
+    fn is_u64(&self) -> bool {
+        self.token.eq("uint") || self.token.eq("u64")
     }
 }
 
@@ -536,7 +645,45 @@ impl IntLimits {
             let inner: ParseBuffer;
             let paren = syn::parenthesized!(inner in input);
             let limits = inner.parse_terminated(IntLimit::parse, Token![,])?;
-            // FIXME: validate limits
+            let mut last_max = usize::MAX;
+            for limit in limits.iter() {
+                match limit {
+                    IntLimit::Range(r) => {
+                        if let Some(start) = &r.start {
+                            if let syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Int(i),
+                                ..
+                            }) = start.as_ref()
+                            {
+                                if last_max != usize::MAX {
+                                    if last_max > i.base10_parse()? {
+                                        i.span().to_syn_error("range conflict").to_err()?;
+                                    }
+                                }
+                            } else {
+                                start.span().to_syn_error("expect integer value").to_err()?;
+                            }
+                        }
+                        if let Some(end) = &r.end {
+                            if let syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Int(i),
+                                ..
+                            }) = end.as_ref()
+                            {
+                                last_max = i.base10_parse()?;
+                            } else {
+                                end.span().to_syn_error("expect integer value").to_err()?;
+                            }
+                        }
+                    }
+                    IntLimit::Opt(v) => {
+                        let v = v.base10_parse()?;
+                        if v > last_max {
+                            last_max = v;
+                        }
+                    }
+                }
+            }
             Ok(Some(Self { paren, limits }))
         } else {
             Ok(None)
@@ -557,9 +704,9 @@ impl Parse for IntLimit {
 
 impl FloatType {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(float) = input.try_parse_as_ident("float", false) {
+        if let Some(float) = input.try_parse_one_of_idents(("float", "f64", "f32")) {
             Ok(Some(Self {
-                span: float.span(),
+                token: float,
                 limits: FloatLimits::try_parse(input)?,
             }))
         } else {
@@ -581,7 +728,7 @@ impl FloatLimits {
     }
 }
 
-impl<A: TryParse, X: TryParse> TryParse for JsonStringType<A, X> {
+impl<A: AsFieldAlias, X: AsFieldAssignment> TryParse for JsonStringType<A, X> {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
         if let Some(json) = input.try_parse_as_ident("json", false) {
             let inner: ParseBuffer;
@@ -614,19 +761,95 @@ impl DateTimeStringType {
     }
 }
 
-impl<T: ParseType, A: TryParse, X: TryParse> Parse for Field<T, A, X> {
+impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Parse for Field<T, A, X> {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let name = input.parse_as_lit_str()?;
         let optional = input.try_parse_question();
         T::peek(input)?;
         let typ = T::parse_type(input)?;
+        let alias = A::try_parse(input)?;
+        let expr = X::try_parse(input)?;
+        let field_name = if let Some(alias) = &alias {
+            if let Some(alias) = alias.as_alias() {
+                alias.clone()
+            } else {
+                name.to_ident_with_case(Case::Snake)
+            }
+        } else {
+            name.to_ident_with_case(Case::Snake)
+        };
+        let mut default = None;
+        if let Some(Type::Constant(c)) = typ.as_type() {
+            default = Some(c.to_value());
+        } else if let Some(x) = &expr {
+            if let Some(Expr::Constant(c)) = x.as_assignment() {
+                default = Some(c.to_value());
+            }
+        }
+        if let Some(opt) = &optional {
+            default = Some(syn::Path::from_ident(("None", opt.span()).to_ident()).to_expr());
+        }
         Ok(Self {
             name,
-            optional,
+            field_name,
+            optional: optional.map(|o| o.span()),
             typ,
-            alias: A::try_parse(input)?,
-            expr: X::try_parse(input)?,
+            alias,
+            expr,
+            default,
         })
+    }
+}
+
+impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X> {
+    fn requires_to_simple_type(&self) -> syn::Result<()> {
+        if let Some(t) = self.typ.as_type() {
+            match t {
+                Type::Object(_) => t.to_span().to_syn_error("unsupported type").to_err(),
+                Type::Map(_) => t.to_span().to_syn_error("unsupported type").to_err(),
+                _ => Ok(()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_constant_expr_with_type(&self) -> syn::Result<()> {
+        if let (Some(t), Some(x)) = (self.typ.as_type(), self.expr.as_ref()) {
+            if let Some(x) = x.as_assignment() {
+                let okay = is_type_and_value_match(t, x);
+                if !okay {
+                    (t.to_span(), x.to_span())
+                        .to_span()
+                        .to_syn_error("unmatch type with value")
+                        .to_err()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_type_and_constant_match<A, X>(t: &Type<A, X>, c: &Constant) -> bool {
+    match (t, c) {
+        (Type::String(_), Constant::String(_)) => true,
+        (Type::Integer(_), Constant::Int(_)) => true,
+        (Type::Float(_), Constant::Float(_)) => true,
+        (Type::Bool(_), Constant::Bool(_)) => true,
+        _ => false,
+    }
+}
+
+fn is_type_and_value_match<A, X>(t: &Type<A, X>, x: &Expr) -> bool {
+    match (t, x) {
+        (Type::String(_), Expr::Json(_)) => true,
+        (Type::String(_), Expr::Datetime(_)) => true,
+        (Type::String(_), Expr::Format(_)) => true,
+        (Type::String(_), Expr::Join(_)) => true,
+        (Type::Integer(i), Expr::Timestamp(_)) => i.is_u64(),
+        (t, Expr::Constant(c)) => is_type_and_constant_match(t, c),
+        (t, Expr::Or(OrExpr { default, .. })) => is_type_and_constant_match(t, default),
+        _ => false,
     }
 }
 
@@ -656,12 +879,40 @@ impl Parse for Expr {
     }
 }
 
+impl ToSpan for Expr {
+    fn to_span(&self) -> Span {
+        match self {
+            Self::Constant(x) => x.to_span(),
+            Self::Variable(x) => x.to_span(),
+            Self::Json(x) => x.to_span(),
+            Self::Format(x) => x.to_span(),
+            Self::Datetime(x) => x.to_span(),
+            Self::Timestamp(x) => x.to_span(),
+            Self::Join(x) => x.to_span(),
+            Self::Or(x) => x.to_span(),
+        }
+    }
+}
+
 impl Parse for Constant {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         if let Some(constant) = Self::try_parse(input)? {
             Ok(constant)
         } else {
             input.span().to_syn_error("missing constant").to_err()
+        }
+    }
+}
+
+impl ToSpan for Constant {
+    fn to_span(&self) -> Span {
+        match self {
+            Constant::String(c) => c.span(),
+            Constant::Bool(c) => c.span(),
+            Constant::Int(c) => c.span(),
+            Constant::Float(c) => c.span(),
+            Constant::Object(c) => c.span,
+            Constant::Array(c) => c.span,
         }
     }
 }
@@ -685,7 +936,7 @@ impl Constant {
         })
     }
 
-    fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Constant::String(s) => s.span(),
             Constant::Bool(b) => b.span(),
@@ -693,6 +944,30 @@ impl Constant {
             Constant::Float(f) => f.span(),
             Constant::Object(o) => o.span(),
             Constant::Array(a) => a.span(),
+        }
+    }
+
+    pub fn to_value(&self) -> syn::Expr {
+        match self {
+            Constant::String(c) => syn::Expr::MethodCall(syn::ExprMethodCall {
+                attrs: vec![],
+                receiver: Box::new(c.to_expr()),
+                dot_token: Token![.](c.span()),
+                method: ("to_owned", c.span()).to_ident(),
+                turbofish: None,
+                paren_token: Paren(c.span()),
+                args: Punctuated::new(),
+            }),
+            Constant::Bool(c) => c.to_expr(),
+            Constant::Int(c) => c.to_expr(),
+            Constant::Float(c) => c.to_expr(),
+            Constant::Object(c) => todo!(),
+            Constant::Array(c) => c
+                .elements
+                .iter()
+                .map(|c| c.to_value())
+                .collect::<Vec<_>>()
+                .to_expr(),
         }
     }
 }
@@ -723,7 +998,7 @@ impl Parse for ObjectConstant {
 }
 
 impl ObjectConstant {
-    fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         self.span
     }
 }
@@ -748,7 +1023,7 @@ impl Parse for ConstantArray {
 }
 
 impl ConstantArray {
-    fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         self.span
     }
 }
@@ -782,6 +1057,16 @@ impl Variable {
     }
 }
 
+impl ToSpan for Variable {
+    fn to_span(&self) -> Span {
+        if let Some(typ) = &self.typ {
+            (self.dollar, typ.to_span()).to_span()
+        } else {
+            (self.dollar, self.name.span()).to_span()
+        }
+    }
+}
+
 impl Parse for Variable {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let dollar = input.parse()?;
@@ -797,6 +1082,12 @@ impl OrExpr {
             or,
             default: input.parse()?,
         })
+    }
+}
+
+impl ToSpan for OrExpr {
+    fn to_span(&self) -> Span {
+        (self.variable.to_span(), self.default.to_span()).to_span()
     }
 }
 
@@ -822,6 +1113,11 @@ impl FormatFn {
         }
     }
 }
+impl ToSpan for FormatFn {
+    fn to_span(&self) -> Span {
+        (self.fn_token, self.paren.span.close()).to_span()
+    }
+}
 
 impl JsonStringifyFn {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
@@ -837,6 +1133,11 @@ impl JsonStringifyFn {
         } else {
             Ok(None)
         }
+    }
+}
+impl ToSpan for JsonStringifyFn {
+    fn to_span(&self) -> Span {
+        (self.fn_token, self.paren.span.close()).to_span()
     }
 }
 
@@ -860,6 +1161,11 @@ impl DatetimeFn {
         }
     }
 }
+impl ToSpan for DatetimeFn {
+    fn to_span(&self) -> Span {
+        (self.token, self.paren.span.close()).to_span()
+    }
+}
 
 impl JoinStringFn {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
@@ -880,10 +1186,15 @@ impl JoinStringFn {
         }
     }
 }
+impl ToSpan for JoinStringFn {
+    fn to_span(&self) -> Span {
+        (self.token, self.paren.span.close()).to_span()
+    }
+}
 
 impl UnixTimestampUintFn {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(ident) = input.try_parse_as_ident("timestamp", false) {
+        if let Some(ident) = input.try_parse_one_of_idents(("timestamp", "unix_timestamp")) {
             let inner: ParseBuffer;
             let paren = syn::parenthesized!(inner in input);
             let variable = Variable::parse(&inner)?;
@@ -895,5 +1206,11 @@ impl UnixTimestampUintFn {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl ToSpan for UnixTimestampUintFn {
+    fn to_span(&self) -> Span {
+        (self.token, self.paren.span.close()).to_span()
     }
 }
