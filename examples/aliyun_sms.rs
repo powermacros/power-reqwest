@@ -23,7 +23,7 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-signature-management
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-addsmssign
-    post add_sms_sign("https://$api.aliyuncs.com") {
+    post add_sms_sign("https://$$api.aliyuncs.com") {
         form {
             Action: "AddSmsSign",
             SignName: string = $sign_name,
@@ -45,7 +45,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-deletesmssign
-    post delete_sms_sign("https://$api.aliyuncs.com") {
+    post delete_sms_sign("https://$$api.aliyuncs.com") {
         form {
             Action: "DeleteSmsSign",
             SignName: string = $sign_name
@@ -60,7 +60,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-modifysmssign
-    post modify_sms_sign("https://$api.aliyuncs.com") {
+    post modify_sms_sign("https://$$api.aliyuncs.com") {
         form {
             Action: "ModifySmsSign",
             SignName: string = $sign_name,
@@ -82,7 +82,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysmssignlist
-    post query_sms_sign_list("https://$api.aliyuncs.com") {
+    post query_sms_sign_list("https://$$api.aliyuncs.com") {
         form {
             Action: "QuerySmsSignList",
             PageIndex?: uint(1..) = $page_index,
@@ -100,18 +100,18 @@ reqwest! {
                 OrderId: string,
                 SignName: string,
                 AuditStatus: string,
-                CreateDate: datetime("yyyy-MM-dd HH:mm:ss"),
+                CreateDate: datetime("%y-%m-%d %H:%M:%S"),
                 Reason {
                     RejectInfo: string,
                     RejectSubInfo: string,
-                    RejectDate: datetime("yyyy-MM-dd HH:mm:ss"),
+                    RejectDate: datetime("%y-%m-%d %H:%M:%S"),
                 },
                 BusinessType: string,
             }[] -> records
         }
     }
 
-    post query_sms_sign("https://$api.aliyuncs.com") {
+    post query_sms_sign("https://$$api.aliyuncs.com") {
         form {
             Action: "QuerySmsSign",
             SignName: string = $sign_name
@@ -124,11 +124,11 @@ reqwest! {
             OrderId: string,
             SignName: string,
             AuditStatus: string,
-            CreateDate: datetime("yyyy-MM-dd HH:mm:ss"),
+            CreateDate: datetime("%y-%m-%d %H:%M:%S"),
             Reason {
                 RejectInfo: string,
                 RejectSubInfo: string,
-                RejectDate: datetime("yyyy-MM-dd HH:mm:ss"),
+                RejectDate: datetime("%y-%m-%d %H:%M:%S"),
             },
             BusinessType: string,
         }
@@ -138,7 +138,7 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-template-management
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-addsmstemplate
-    post add_sms_template("https://$api.aliyuncs.com") {
+    post add_sms_template("https://$$api.aliyuncs.com") {
         form {
             Action: "AddSmsTemplate",
             TemplateType: uint(0..=3) = $template_type,
@@ -156,7 +156,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-deletesmstemplate
-    post delete_sms_template("https://$api.aliyuncs.com") {
+    post delete_sms_template("https://$$api.aliyuncs.com") {
         form {
             Action: "DeleteSmsTemplate",
             TemplateCode: string = $template_code,
@@ -171,7 +171,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-modifysmstemplate
-    post modify_sms_template("https://$api.aliyuncs.com") {
+    post modify_sms_template("https://$$api.aliyuncs.com") {
         form {
             Action: "ModifySmsTemplate",
             TemplateCode: string = $template_code,
@@ -190,7 +190,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysmstemplatelist
-    post query_sms_template_list("https://$api.aliyuncs.com") {
+    post query_sms_template_list("https://$$api.aliyuncs.com") {
         form {
             Action: "QuerySmsTemplateList",
             PageIndex?: uint(1..) = $page_index,
@@ -212,18 +212,18 @@ reqwest! {
                 TemplateType: uint(0..=4),
                 AuditStatus: string,
                 TemplateContent: string,
-                CreateDate: datetime("yyyy-MM-dd HH:mm:ss"),
+                CreateDate: datetime("%y-%m-%d %H:%M:%S"),
                 Reason {
                     RejectInfo: string,
                     RejectSubInfo: string,
-                    RejectDate: datetime("yyyy-MM-dd HH:mm:ss"),
+                    RejectDate: datetime("%y-%m-%d %H:%M:%S"),
                 },
             }[] -> records
         }
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysmstemplate
-    post query_sms_template("https://$api.aliyuncs.com") {
+    post query_sms_template("https://$$api.aliyuncs.com") {
         form {
             Action: "QuerySmsTemplate",
             TemplateCode: string = $template_code,
@@ -240,11 +240,11 @@ reqwest! {
             TemplateType: uint(0..=4),
             AuditStatus: string,
             TemplateContent: string,
-            CreateDate: datetime("yyyy-MM-dd HH:mm:ss"),
+            CreateDate: datetime("%y-%m-%d %H:%M:%S"),
             Reason {
                 RejectInfo: string,
                 RejectSubInfo: string,
-                RejectDate: datetime("yyyy-MM-dd HH:mm:ss"),
+                RejectDate: datetime("%y-%m-%d %H:%M:%S"),
             },
         }
     }
@@ -253,7 +253,7 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-send-sms
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-sendsms
-    post send_sms("https://$api.aliyuncs.com") {
+    post send_sms("https://$$api.aliyuncs.com") {
         form {
             Action: "SendSms",
             PhoneNumbers: string = join_string($phone_numbers: string[], ","),
@@ -272,7 +272,7 @@ reqwest! {
         }
     }
 
-    post send_batch_sms("https://$api.aliyuncs.com") {
+    post send_batch_sms("https://$$api.aliyuncs.com") {
         form {
             Action: "SendBatchSms",
             PhoneNumberJson: string = json($phone_numbers: string[]),
@@ -296,12 +296,12 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-send-query
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysenddetails
-    post query_send_detail("https://$api.aliyuncs.com") {
+    post query_send_detail("https://$$api.aliyuncs.com") {
         form {
             Action: "QuerySendDetails",
             PhoneNumber: string = $phone_number,
             BizId: string = $biz_id,
-            SendDate: datetime("yyyyMMdd") = $send_date,
+            SendDate: datetime("%y%m%d") = $send_date,
             PageSize?: uint(1..=50) = $page_size,
             CurrentPage?: uint(1..) = $current_page
         }
@@ -327,12 +327,12 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysendstatistics
-    post query_send_statistics("https://$api.aliyuncs.com") {
+    post query_send_statistics("https://$$api.aliyuncs.com") {
         form {
             Action: "QuerySendStatistics",
             IsGlobe: uint(1,2) = $globe,
-            StartDate: string = datetime($start_date, "yyyyMMdd"),
-            EndDate: string = datetime($end_date, "yyyyMMdd"),
+            StartDate: string = datetime($start_date, "%y%m%d"),
+            EndDate: string = datetime($end_date, "%y%m%d"),
             PageIndex: uint(1..) = $page_index,
             PageSize: uint(1..=50) = $page_size,
             TemplateType: uint(0,1,2,3,7) = $template_type,
@@ -349,7 +349,7 @@ reqwest! {
                 RespondedSuccessCount: uint,
                 RespondedFailCount: uint,
                 NoRespondedCount: uint,
-                SendDate: datetime("yyyyMMdd")
+                SendDate: datetime("%y%m%d")
             }
         }
     }
@@ -358,7 +358,7 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-card-sms
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-getossinfoforcardtemplate
-    post get_oss_info_for_card_template("https://$api.aliyuncs.com") {
+    post get_oss_info_for_card_template("https://$$api.aliyuncs.com") {
         form {
             Action: "GetOSSInfoForCardTemplate"
         }
@@ -381,7 +381,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-getmediaresourceid
-    post get_media_resource_id("https://$api.aliyuncs.com") {
+    post get_media_resource_id("https://$$api.aliyuncs.com") {
         form {
             Action: "GetMediaResourceId",
             ResourceType: uint(1,2,3,4) = $resource_type,
@@ -403,7 +403,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-createcardsmstemplate
-    post create_card_sms_template("https://$api.aliyuncs.com") {
+    post create_card_sms_template("https://$$api.aliyuncs.com") {
         form {
             Action: "CreateCardSmsTemplate",
             TemplateName: string = $template_name,
@@ -447,7 +447,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querycardsmstemplate
-    post query_card_sms_template("https://$api.aliyuncs.com") {
+    post query_card_sms_template("https://$$api.aliyuncs.com") {
         form {
             Action: "QueryCardSmsTemplate",
             TemplateCode: string = $template_code
@@ -477,7 +477,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-checkmobilescardsupport
-    post check_mobiles_card_support("https://$api.aliyuncs.com") {
+    post check_mobiles_card_support("https://$$api.aliyuncs.com") {
         form {
             Action: "CheckMobilesCardSupport",
             TemplateCode: string = $template_code,
@@ -498,7 +498,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querymobilescardsupport
-    post query_mobiles_card_support("https://$api.aliyuncs.com") {
+    post query_mobiles_card_support("https://$$api.aliyuncs.com") {
         form {
             Action: "QueryMobilesCardSupport",
             TemplateCode: string = $template_code,
@@ -519,7 +519,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-getcardsmslink
-    post get_card_sms_link("https://$api.aliyuncs.com") {
+    post get_card_sms_link("https://$$api.aliyuncs.com") {
         form {
             Action: "GetCardSmsLink",
             CardTemplateCode: string = $card_template_code,
@@ -548,12 +548,12 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querycardsmstemplatereport
-    post query_card_sms_template_report("https://$api.aliyuncs.com") {
+    post query_card_sms_template_report("https://$$api.aliyuncs.com") {
         form {
             Action: "QueryCardSmsTemplateReport",
             TemplateCodes: string[] = $template_codes,
-            StartDate: string = datetime($start_date, "yyyy-MM-dd HH:mm:ss"),
-            EndDate: string = datetime($end_date, "yyyy-MM-dd HH:mm:ss"),
+            StartDate: string = datetime($start_date, "%y-%m-%d %H:%M:%S"),
+            EndDate: string = datetime($end_date, "%y-%m-%d %H:%M:%S"),
         }
     } -> {
         json {
@@ -563,7 +563,7 @@ reqwest! {
             Data? {
                 model {
                     tmpCode: string,
-                    date: datetime("yyyy-MM-dd HH:mm:ss"),
+                    date: datetime("%y-%m-%d %H:%M:%S"),
                     rptSuccessCount: uint,
                     exposeUv: uint,
                     exposePv: uint,
@@ -575,7 +575,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-sendcardsms
-    post send_card_sms("https://$api.aliyuncs.com") {
+    post send_card_sms("https://$$api.aliyuncs.com") {
         form {
             Action: "SendCardSms",
             CardObjects: {
@@ -612,7 +612,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-sendbatchcardsms
-    post send_batch_card_sms("https://$api.aliyuncs.com") {
+    post send_batch_card_sms("https://$$api.aliyuncs.com") {
         form: {
             Action: "SendBatchCardSms",
             CardTemplateCode: string = $card_template_code,
@@ -649,7 +649,7 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-domestic-and-international-sms-conversion-rate
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-smsconversionintl
-    post sms_coversion_intl("https://$api.aliyuncs.com") {
+    post sms_coversion_intl("https://$$api.aliyuncs.com") {
         form {
             Action: "SmsConversionIntl",
             MessageId: string = $message_id,
@@ -666,7 +666,7 @@ reqwest! {
 
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-conversiondataintl
-    post conversion_data_intl("https://$api.aliyuncs.com") {
+    post conversion_data_intl("https://$$api.aliyuncs.com") {
         form {
             Action: "ConversionDataIntl",
             ReportTime?: uint = timestamp($report_time),
@@ -684,7 +684,7 @@ reqwest! {
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-dir-label-management
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-listtagresources
-    post list_tag_resources("https://$api.aliyuncs.com") {
+    post list_tag_resources("https://$$api.aliyuncs.com") {
         form {
             Action: "ListTagResources",
             ResourceType: string = $resource_type || "TEMPLATE",
@@ -713,7 +713,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-tagresources
-    post tag_resources("https://$api.aliyuncs.com") {
+    post tag_resources("https://$$api.aliyuncs.com") {
         form {
             Action: "TagResources",
             ResourceType: string = $resource_type || "TEMPLATE",
@@ -734,7 +734,7 @@ reqwest! {
     }
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-untagresources
-    post untag_resources("https://$api.aliyuncs.com") {
+   post untag_resources("https://$$api.aliyuncs.com") {
         form: {
             Action: "UntagResources",
             ResourceType: string = $resource_type || "TEMPLATE",

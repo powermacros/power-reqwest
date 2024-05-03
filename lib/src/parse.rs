@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use convert_case::{Case, Casing};
 use proc_macro2::Span;
 use syn::{
@@ -13,7 +15,7 @@ use syn_prelude::{
     WithPrefix, WithSuffix,
 };
 
-use crate::model::*;
+use crate::{model::*, url_parser::parse_uri_and_update_api};
 
 impl Parse for Client {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
@@ -94,6 +96,20 @@ impl Parse for Client {
             options.struct_name = client.name.with_suffix("Options");
         }
         client.resolve_object_type_names()?;
+
+        let option_map = if let Some(options) = &client.options {
+            options
+                .fields
+                .iter()
+                .map(|f| (&f.field_name, &f.typ))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        for api in client.apis.iter_mut() {
+            api.check_and_update_with_client_option_vars(&option_map)?;
+        }
+
         Ok(client)
     }
 }
@@ -251,15 +267,9 @@ impl Api {
             }
             let url_input: ParseBuffer;
             let paren = syn::parenthesized!(url_input in input);
-            let uri: LitStr = url_input.parse()?;
-            if !url_input.is_empty() {
-                url_input
-                    .span()
-                    .to_syn_error("unexpected content")
-                    .to_err()?;
-            }
+            let uri: ApiUri = url_input.parse()?;
 
-            let request = input.parse()?;
+            let request = ApiRequest::parse(input)?;
             let response = if input.peek(Token![->]) {
                 input.parse::<Token![->]>()?;
                 Some(input.parse()?)
@@ -271,27 +281,99 @@ impl Api {
                 method,
                 name,
                 paren,
-                uri: ApiUri {
-                    uri,
-                    schema: None,
-                    user: None,
-                    passwd: None,
-                    host: None,
-                    port: None,
-                    uri_path: None,
-                    uri_query: None,
-                    fragment: None,
-                },
+                uri,
                 request,
                 response,
+                variables: vec![],
             }))
         } else {
             Ok(None)
         }
     }
+
+    fn check_and_update_with_client_option_vars(
+        &mut self,
+        options: &HashMap<&Ident, &Type<(), (Token![=], Expr)>>,
+    ) -> syn::Result<()> {
+        self.uri.collect_vars(&mut self.variables)?;
+        self.request.collect_vars(&mut self.variables)?;
+
+        for var in self.variables.iter_mut() {
+            if var.client_option {
+                if let Some(opt_type) = options.get(&var.name) {
+                    if let Some(typ) = &var.typ {
+                        if opt_type.ne(&typ) {
+                            (typ.to_span(), opt_type.to_span())
+                                .to_span()
+                                .to_syn_error("unmatched type with client option")
+                                .to_err()?;
+                        }
+                    } else {
+                        var.typ = Some(opt_type.pure());
+                    }
+                } else {
+                    var.name.to_syn_error("no such option").to_err()?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-impl Parse for ApiRequest {
+impl Parse for ApiUri {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let uri: LitStr = input.parse()?;
+        let mut x = ApiUri {
+            uri_format: uri,
+            uri_variables: vec![],
+            schema: None,
+            user: None,
+            passwd: None,
+            host: None,
+            port: None,
+            port_var: None,
+            uri_path: None,
+            uri_query: None,
+            fragment: None,
+        };
+        parse_uri_and_update_api(&mut x)?;
+        Ok(x)
+    }
+}
+
+impl ApiUri {
+    fn collect_vars(&self, variables: &mut Vec<Variable>) -> syn::Result<()> {
+        for var in self.uri_variables.iter() {
+            variables.collect::<(), (), ()>(var, &())?;
+        }
+        if let Some(var) = &self.port_var {
+            variables.collect::<Type<(), ()>, (), ()>(
+                var,
+                &Type::Integer(IntegerType {
+                    token: ("u16", var.name.span()).to_ident(),
+                    limits: None,
+                }),
+            )?;
+        }
+        if let Some(path) = &self.uri_path {
+            for seg in path.segments.iter() {
+                if let ApiUriSeg::Var(var) = seg {
+                    variables.collect::<(), (), ()>(var, &())?;
+                }
+            }
+        }
+        if let Some(query) = &self.uri_query {
+            for field in query.fields.iter() {
+                if let Some((_, Expr::Variable(var))) = &field.expr {
+                    variables.collect::<(), (), ()>(var, &())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ApiRequest {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let brace = syn::braced!(inner in input);
@@ -316,7 +398,8 @@ impl Parse for ApiRequest {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                request.json = Some(RequestJson::parse(input, json.span())?);
+                let json = RequestJson::parse(input, json.span())?;
+                request.json = Some(json);
             } else if let Some(query) = inner.try_parse_as_ident("query", false) {
                 if let Some(prev) = request.query {
                     (query.span(), prev.token)
@@ -325,7 +408,8 @@ impl Parse for ApiRequest {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                request.query = Some(RequestQueries::parse(&inner, query.span())?);
+                let query = RequestQueries::parse(&inner, query.span())?;
+                request.query = Some(query);
             } else if let Some(form) = inner.try_parse_as_ident("form", false) {
                 if let Some(prev) = &request.form {
                     (form.span(), prev.token)
@@ -334,7 +418,8 @@ impl Parse for ApiRequest {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                request.form = Some(RequestForm::parse(&inner, form.span())?);
+                let form = RequestForm::parse(&inner, form.span())?;
+                request.form = Some(form);
             } else if let Some(header) = inner.try_parse_as_ident("header", false) {
                 if let Some(prev) = &request.header {
                     (header.span(), prev.token)
@@ -343,7 +428,8 @@ impl Parse for ApiRequest {
                         .to_err()?;
                 }
                 input.try_parse_colon();
-                request.header = Some(RequestHeaders::parse(&inner, header.span())?);
+                let header = RequestHeaders::parse(&inner, header.span())?;
+                request.header = Some(header);
             } else {
                 inner
                     .span()
@@ -353,6 +439,72 @@ impl Parse for ApiRequest {
         }
 
         Ok(request)
+    }
+
+    fn collect_vars(&self, vars: &mut Vec<Variable>) -> syn::Result<()> {
+        if let Some(header) = &self.header {
+            header.collect_vars(vars)?;
+        }
+        if let Some(query) = &self.query {
+            query.collect_vars(vars)?;
+        }
+        if let Some(json) = &self.json {
+            json.collect_vars(vars)?;
+        }
+        if let Some(form) = &self.form {
+            form.collect_vars(vars)?;
+        }
+        Ok(())
+    }
+}
+
+trait VariableCollector {
+    fn collect<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment>(
+        &mut self,
+        var: &Variable,
+        suggested_type: &T,
+    ) -> syn::Result<()>;
+}
+
+impl VariableCollector for Vec<Variable> {
+    fn collect<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment>(
+        &mut self,
+        var: &Variable,
+        suggested_type: &T,
+    ) -> syn::Result<()> {
+        if let Some(old) = self.iter().find(|old| old.name.eq(&var.name)) {
+            if let Some(old_type) = &old.typ {
+                if let Some(typ) = suggested_type.as_type() {
+                    // compare type
+                    if typ.ne(old_type) {
+                        (typ.to_span(), old_type.to_span())
+                            .to_span()
+                            .to_syn_error("unmatched variable type")
+                            .to_err()?;
+                    }
+                } else if !old_type.is_string() {
+                    // check old type is string
+                    old_type
+                        .to_span()
+                        .to_syn_error("expect string type for the variable")
+                        .to_err()?;
+                }
+            } else if let Some(typ) = suggested_type.as_type() {
+                // check new type whether is string
+                if !typ.is_string() {
+                    (typ.to_span(), old.name.span())
+                        .to_span()
+                        .to_syn_error("expect string type (unmatched with previous variable type)")
+                        .to_err()?;
+                }
+            }
+        }
+        let mut var = var.clone();
+        if var.typ.is_none() {
+            var.typ = suggested_type.as_type().map(|t| t.pure())
+        }
+        self.push(var);
+        Ok(())
     }
 }
 
@@ -446,14 +598,26 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T
             fields,
         })
     }
-}
 
-impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T, A, X> {
     fn resolve_types(&mut self, name: Ident) -> syn::Result<()> {
         let prefix = name.to_string();
         self.struct_name = name.clone();
         for field in self.fields.iter_mut() {
             field.resolve_field_type(&prefix)?;
+        }
+        Ok(())
+    }
+
+    fn collect_vars<C: VariableCollector>(&self, vars: &mut C) -> syn::Result<()> {
+        for f in self.fields.iter() {
+            if let Some(x) = &f.expr {
+                if let Some(x) = x.as_assignment() {
+                    x.collect_vars(vars, &f.typ)?;
+                }
+            }
+            if let Some(Type::Object(obj)) = f.typ.as_type() {
+                obj.collect_vars(vars)?;
+            }
         }
         Ok(())
     }
@@ -476,8 +640,15 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X>
                         obj.resolve_type_name(&self.field_name, prefix, true)?;
                     }
                 }
-                Type::DatetimeString(DateTimeStringType { formatter, .. }) => {
-                    // FIXME: set formatter mod name
+                Type::Datetime(DateTimeType { format, .. }) => {
+                    if let Some(format) = format {
+                        format.mod_name = self
+                            .field_name
+                            .to_ident_with_case(Case::Snake)
+                            .with_prefix("_")
+                            .with_prefix(prefix.to_case(Case::Snake))
+                            .with_suffix("_formatter");
+                    }
                 }
                 _ => {}
             }
@@ -499,6 +670,20 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
         let obj_name = self.struct_name.to_string();
         for child in self.fields.iter_mut() {
             child.resolve_field_type(&obj_name)?;
+        }
+        Ok(())
+    }
+
+    fn collect_vars<C: VariableCollector>(&self, vars: &mut C) -> syn::Result<()> {
+        for f in self.fields.iter() {
+            if let Some(x) = &f.expr {
+                if let Some(Expr::Variable(var)) = x.as_assignment() {
+                    vars.collect(var, &f.typ)?;
+                }
+            }
+            if let Some(Type::Object(obj)) = f.typ.as_type() {
+                obj.collect_vars(vars)?;
+            }
         }
         Ok(())
     }
@@ -545,8 +730,8 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
             Self::Map(object.span())
         } else if let Some(float) = FloatType::try_parse(input)? {
             Self::Float(float)
-        } else if let Some(datetime) = DateTimeStringType::try_parse(input)? {
-            Self::DatetimeString(datetime)
+        } else if let Some(datetime) = DateTimeType::try_parse(input)? {
+            Self::Datetime(datetime)
         } else if let Some(constant) = Constant::try_parse(input)? {
             Self::Constant(constant)
         } else {
@@ -567,7 +752,7 @@ impl<A, X> ToSpan for Type<A, X> {
             Self::Integer(i) => i.token.span(),
             Self::Float(f) => f.token.span(),
             Self::Object(o) => o.brace.span.close(),
-            Self::DatetimeString(d) => d.span,
+            Self::Datetime(d) => d.span,
             Self::JsonText(j) => j.span,
             Self::Map(s) => *s,
             Self::List(l) => (l.element_type.to_span(), l.bracket.span.close()).to_span(),
@@ -733,7 +918,7 @@ impl FloatLimits {
 
 impl<A: AsFieldAlias, X: AsFieldAssignment> TryParse for JsonStringType<A, X> {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(json) = input.try_parse_as_ident("json", false) {
+        if let Some(json) = input.try_parse_one_of_idents(("json", "json_string")) {
             let inner: ParseBuffer;
             let paren = syn::parenthesized!(inner in input);
             Ok(Some(Self {
@@ -747,17 +932,29 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> TryParse for JsonStringType<A, X> {
     }
 }
 
-impl DateTimeStringType {
+impl DateTimeFormat {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(ident) = input.try_parse_one_of_idents(("datetime", "date")) {
+        if input.peek(syn::token::Paren) {
             let inner: ParseBuffer;
             let paren = syn::parenthesized!(inner in input);
             let format = inner.parse::<LitStr>()?;
             Ok(Some(Self {
                 paren,
-                span: ident.span(),
+                mod_name: ("_", format.span()).to_ident(),
                 format,
-                formatter: syn::Path::new(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl DateTimeType {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) = input.try_parse_one_of_idents(("datetime", "date")) {
+            Ok(Some(Self {
+                span: ident.span(),
+                format: DateTimeFormat::try_parse(input)?,
             }))
         } else {
             Ok(None)
@@ -914,6 +1111,64 @@ impl ToSpan for Expr {
             Self::Join(x) => x.to_span(),
             Self::Or(x) => x.to_span(),
         }
+    }
+}
+
+impl Expr {
+    fn collect_vars<
+        T: AsFieldType<A, X>,
+        A: AsFieldAlias,
+        X: AsFieldAssignment,
+        C: VariableCollector,
+    >(
+        &self,
+        vars: &mut C,
+        suggested_type: &T,
+    ) -> syn::Result<()> {
+        match self {
+            Expr::Variable(var) => {
+                vars.collect(var, suggested_type)?;
+            }
+            Expr::Datetime(call) => {
+                vars.collect::<Type<(), ()>, (), ()>(
+                    &call.variable,
+                    &Type::Datetime(DateTimeType {
+                        span: call.variable.name.span(),
+                        format: None,
+                    }),
+                )?;
+            }
+            Expr::Json(call) => {
+                vars.collect::<Type<(), ()>, (), ()>(
+                    &call.variable,
+                    &Type::Map(call.variable.name.span()),
+                )?;
+            }
+            Expr::Timestamp(call) => {
+                vars.collect::<Type<(), ()>, (), ()>(
+                    &call.variable,
+                    &Type::Datetime(DateTimeType {
+                        span: call.variable.name.span(),
+                        format: None,
+                    }),
+                )?;
+            }
+            Expr::Format(call) => {
+                if let Some(args) = &call.args {
+                    for arg in args {
+                        arg.collect_vars::<Type<(), ()>, (), (), C>(
+                            vars,
+                            &Type::String(StringType {
+                                span: arg.to_span(),
+                            }),
+                        )?;
+                    }
+                }
+            }
+            Expr::Or(or) => vars.collect(&or.variable, suggested_type)?,
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -1074,12 +1329,14 @@ impl Variable {
                 dollar: dollar.span,
                 name,
                 typ: Some(Type::parse_type(input)?),
+                client_option: false,
             }
         } else {
             Self {
                 dollar: dollar.span,
                 name,
                 typ: None,
+                client_option: false,
             }
         })
     }
@@ -1177,7 +1434,6 @@ impl DatetimeFn {
             let variable = Variable::parse(&inner)?;
             inner.parse::<Token![,]>()?;
             let format = inner.parse::<LitStr>()?;
-            // FIXME: validate format
             Ok(Some(Self {
                 token: ident.span(),
                 paren,

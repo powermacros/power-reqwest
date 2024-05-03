@@ -1,33 +1,39 @@
 pub mod url_parser {
+    use std::net::Ipv4Addr;
+
     use convert_case::{Case, Casing};
     use nom::{
         branch::alt,
-        bytes::complete::{tag, take, take_while1},
+        bytes::complete::{tag, take_while, take_while1},
         character::complete::{alpha1, alphanumeric1, digit1, one_of},
-        combinator::{map, opt},
+        combinator::{map, map_res, opt},
         error::{context, ErrorKind},
         multi::{count, many0, many1, many_m_n},
         sequence::{preceded, separated_pair, terminated, tuple},
         AsChar, IResult, InputTakeAtPosition,
     };
+    use proc_macro2::Span;
     use syn::{LitInt, Token};
-    use syn_prelude::{ToExpr, ToIdent, ToLitStr, ToSynError};
+    use syn_prelude::{ToErr, ToExpr, ToIdent, ToLitStr, ToSynError};
 
-    use crate::{ApiUriPath, ApiUriQuery, ApiUriSeg, Constant, Expr, Field, Variable};
+    use crate::{
+        ApiUriPath, ApiUriQuery, ApiUriSeg, Constant, Expr, Field, FloatType, IntegerType,
+        StringType, Type, Variable,
+    };
 
     pub struct ApiUri<'a> {
         schema: Option<&'a str>,
         auth: Option<(&'a str, Option<&'a str>)>,
-        host: Option<String>,
-        port: Option<u16>,
+        host: Option<IpOrHost<'a>>,
+        port: Option<PortOrVar<'a>>,
         path: Option<UrlPath<'a>>,
         query: Option<UrlQuery<'a>>,
         fragment: Option<&'a str>,
     }
 
     pub fn parse_uri_and_update_api(api: &mut crate::ApiUri) -> syn::Result<()> {
-        let value = api.uri.value();
-        let span = api.uri.span();
+        let value = api.uri_format.value();
+        let span = api.uri_format.span();
         let (
             _,
             ApiUri {
@@ -46,8 +52,55 @@ pub mod url_parser {
         api.passwd = auth
             .map(|(_, pswd)| pswd.map(|pswd| (pswd, span).to_lit_str()))
             .flatten();
-        api.host = host.map(|host| (host, span).to_lit_str());
-        api.port = port.map(|port| LitInt::new(&format!("{port}"), span));
+        if let Some(host_ip) = host {
+            match host_ip {
+                IpOrHost::Ip(ip) => {
+                    let ip = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                    if ip.is_benchmarking()
+                        || ip.is_broadcast()
+                        || ip.is_documentation()
+                        || ip.is_link_local()
+                        || ip.is_multicast()
+                        || ip.is_reserved()
+                        || ip.is_shared()
+                    {
+                        span.to_syn_error("unsupported ip address").to_err()?;
+                    }
+                    api.uri_format = (ip.to_string(), span).to_lit_str();
+                }
+                IpOrHost::Host(host_segs) => {
+                    api.uri_format = (
+                        host_segs
+                            .iter()
+                            .map(|seg| match seg {
+                                HostSeg::Seg(s) => *s,
+                                HostSeg::Var(_) => "{}",
+                            })
+                            .collect::<Vec<_>>()
+                            .join("."),
+                        span,
+                    )
+                        .to_lit_str();
+                    api.uri_variables = host_segs
+                        .iter()
+                        .filter_map(|seg| match seg {
+                            HostSeg::Seg(_) => None,
+                            HostSeg::Var(var) => Some(var.to_variable(span)),
+                        })
+                        .collect::<Vec<_>>();
+                }
+            };
+        }
+        if let Some(port) = port {
+            match port {
+                PortOrVar::Port(port) => {
+                    api.port = Some(LitInt::new(&format!("{port}"), span));
+                }
+                PortOrVar::Var(var) => {
+                    api.port_var = Some(var.to_variable(span));
+                }
+            }
+        }
         api.uri_path = path.map(
             |UrlPath {
                  segments,
@@ -58,7 +111,7 @@ pub mod url_parser {
                     .into_iter()
                     .map(|seg| match seg {
                         Segment::CodePoints(s) => ApiUriSeg::Static((s, span).to_lit_str()),
-                        Segment::Variable(v) => ApiUriSeg::Var((v.name, span).to_ident()),
+                        Segment::Variable(v) => ApiUriSeg::Var(v.to_variable(span)),
                     })
                     .collect(),
             },
@@ -76,11 +129,7 @@ pub mod url_parser {
                                     default = Some((s, span).to_lit_str().to_expr());
                                     Expr::Constant(Constant::String((s, span).to_lit_str()))
                                 }
-                                Segment::Variable(v) => Expr::Variable(Variable {
-                                    dollar: span,
-                                    name: (v.name, span).to_ident(),
-                                    typ: None,
-                                }),
+                                Segment::Variable(v) => Expr::Variable(v.to_variable(span)),
                             },
                         ))
                     } else {
@@ -117,21 +166,9 @@ pub mod url_parser {
             auth = a;
             let (rest, h) = ip_or_host(rest)?;
             host = Some(h);
-            let (rest, port_str) = opt(preceded(
-                tag(":"),
-                context(
-                    "port",
-                    map(many1(digit1), |s| {
-                        s.join("").parse::<u16>().map_err(|_| {
-                            nom::Err::Error(nom::error::Error::new(input, ErrorKind::AlphaNumeric))
-                        })
-                    }),
-                ),
-            ))(rest)?;
+            let (rest, p) = opt(preceded(tag(":"), port_or_var))(rest)?;
+            port = p;
 
-            if let Some(p) = port_str {
-                port = Some(p?);
-            }
             rest
         } else {
             rest
@@ -165,20 +202,38 @@ pub mod url_parser {
         )(input)
     }
 
-    fn host(input: &str) -> IResult<&str, String> {
+    fn host(input: &str) -> IResult<&str, Vec<HostSeg>> {
         context(
             "host",
             alt((
-                tuple((many1(terminated(alphanumerichyphen1, tag("."))), alpha1)),
-                tuple((many_m_n(1, 1, alphanumerichyphen1), take(0 as usize))),
+                map(
+                    tuple((
+                        many1(terminated(host_seg, tag("."))),
+                        alt((
+                            map(alpha1, |s| HostSeg::Seg(s)),
+                            map(variable, |v| HostSeg::Var(v)),
+                        )),
+                    )),
+                    |(mut segs, seg)| {
+                        segs.push(seg);
+                        segs
+                    },
+                ),
+                map(host_seg, |seg| vec![seg]),
             )),
         )(input)
-        .map(|(next_input, mut res)| {
-            if !res.1.is_empty() {
-                res.0.push(res.1);
-            }
-            (next_input, res.0.join("."))
-        })
+    }
+
+    enum HostSeg<'a> {
+        Seg(&'a str),
+        Var(Var<'a>),
+    }
+
+    fn host_seg(input: &str) -> IResult<&str, HostSeg> {
+        alt((
+            map(alphanumerichyphen1, |s| HostSeg::Seg(s)),
+            map(variable, |v| HostSeg::Var(v)),
+        ))(input)
     }
 
     fn alphanumerichyphen1(input: &str) -> IResult<&str, &str> {
@@ -210,24 +265,54 @@ pub mod url_parser {
         }
     }
 
-    fn ip(input: &str) -> IResult<&str, String> {
+    fn ipv4(input: &str) -> IResult<&str, [u8; 4]> {
         context(
             "ip",
-            tuple((count(terminated(ip_num, tag(".")), 3), ip_num)),
+            map(
+                tuple((count(terminated(ip_num, tag(".")), 3), ip_num)),
+                |res| {
+                    let mut result: [u8; 4] = [0, 0, 0, 0];
+                    res.0
+                        .into_iter()
+                        .enumerate()
+                        .for_each(|(i, v)| result[i] = v);
+                    result[3] = res.1;
+                    result
+                },
+            ),
         )(input)
-        .map(|(next_input, res)| {
-            let mut result: [u8; 4] = [0, 0, 0, 0];
-            res.0
-                .into_iter()
-                .enumerate()
-                .for_each(|(i, v)| result[i] = v);
-            result[3] = res.1;
-            (next_input, result.map(|n| n.to_string()).join("."))
-        })
     }
 
-    fn ip_or_host(input: &str) -> IResult<&str, String> {
-        context("ip or host", alt((ip, host)))(input)
+    enum IpOrHost<'a> {
+        Ip([u8; 4]),
+        Host(Vec<HostSeg<'a>>),
+    }
+
+    fn ip_or_host(input: &str) -> IResult<&str, IpOrHost> {
+        context(
+            "ip or host",
+            alt((
+                map(ipv4, |ip| IpOrHost::Ip(ip)),
+                map(host, |host| IpOrHost::Host(host)),
+            )),
+        )(input)
+    }
+
+    enum PortOrVar<'a> {
+        Port(u16),
+        Var(Var<'a>),
+    }
+
+    fn port_or_var(input: &str) -> IResult<&str, PortOrVar> {
+        context(
+            "port",
+            alt((
+                map_res(digit1, |s: &str| {
+                    s.parse().map(|port| PortOrVar::Port(port))
+                }),
+                map(variable, |var| PortOrVar::Var(var)),
+            )),
+        )(input)
     }
 
     pub struct UrlPath<'a> {
@@ -285,19 +370,107 @@ pub mod url_parser {
 
     pub struct Var<'a> {
         name: &'a str,
+        typ: Option<&'static str>,
+        client_option: bool,
+    }
+
+    impl Var<'_> {
+        fn to_variable(&self, span: Span) -> Variable {
+            Variable {
+                dollar: span,
+                name: (self.name, span).to_ident(),
+                client_option: self.client_option,
+                typ: self.typ.map(|typ| match typ {
+                    "string" => Type::String(StringType { span }),
+                    "bool" => Type::Bool(span),
+                    "f32" => Type::Float(FloatType {
+                        token: ("f32", span).to_ident(),
+                        limits: None,
+                    }),
+                    "f64" => Type::Float(FloatType {
+                        token: ("f64", span).to_ident(),
+                        limits: None,
+                    }),
+                    int @ _ => Type::Integer(IntegerType {
+                        token: (int, span).to_ident(),
+                        limits: None,
+                    }),
+                }),
+            }
+        }
     }
 
     fn variable(input: &str) -> IResult<&str, Var> {
         context(
             "variable",
-            preceded(
-                tag("$"),
-                map(
-                    take_while1(|item: char| item.is_alphanum() || item == '_'),
-                    |name| Var { name },
+            alt((
+                variable_with_type,
+                preceded(
+                    tag("$$"),
+                    map(
+                        take_while1(|item: char| item.is_alphanum() || item == '_'),
+                        |name| Var {
+                            name,
+                            typ: None,
+                            client_option: true,
+                        },
+                    ),
                 ),
-            ),
+                preceded(
+                    tag("$"),
+                    map(
+                        take_while1(|item: char| item.is_alphanum() || item == '_'),
+                        |name| Var {
+                            name,
+                            typ: None,
+                            client_option: false,
+                        },
+                    ),
+                ),
+            )),
         )(input)
+    }
+
+    fn variable_with_type(input: &str) -> IResult<&str, Var> {
+        let (rest, _) = tag("$")(input)?;
+        let (rest, _) = take_while(|item: char| item.is_whitespace())(rest)?;
+        let (rest, _) = tag("{")(rest)?;
+        let (rest, _) = take_while(|item: char| item.is_whitespace())(rest)?;
+        let (rest, name) = take_while1(|item: char| item.is_alphanum() || item == '_')(rest)?;
+        let (rest, _) = take_while(|item: char| item.is_whitespace())(rest)?;
+        let (rest, has_type) = opt(tag(":"))(rest)?;
+        let (rest, typ) = if has_type.is_some() {
+            let (rest, _) = take_while(|item: char| item.is_whitespace())(rest)?;
+            let (rest, typ) = alt((
+                map(alt((tag("string"), tag("str"), tag("String"))), |_| {
+                    "string"
+                }),
+                map(alt((tag("int"), tag("integer"), tag("i64"))), |_| "i64"),
+                map(alt((tag("uint"), tag("u64"))), |_| "u64"),
+                map(tag("i8"), |_| "i8"),
+                map(tag("u8"), |_| "u8"),
+                map(tag("i16"), |_| "i16"),
+                map(tag("u16"), |_| "u16"),
+                map(tag("i32"), |_| "i32"),
+                map(tag("u32"), |_| "u32"),
+                map(tag("bool"), |_| "bool"),
+                map(alt((tag("float"), tag("f64"))), |_| "f64"),
+                map(tag("f32"), |_| "f32"),
+            ))(rest)?;
+            let (rest, _) = take_while(|item: char| item.is_whitespace())(rest)?;
+            (rest, Some(typ))
+        } else {
+            (rest, None)
+        };
+        let (rest, _) = tag("}")(rest)?;
+        Ok((
+            rest,
+            Var {
+                name,
+                typ,
+                client_option: false,
+            },
+        ))
     }
 
     pub struct UrlQuery<'a> {
@@ -340,5 +513,3 @@ pub mod url_parser {
         )(input)
     }
 }
-
-pub mod format_parser {}

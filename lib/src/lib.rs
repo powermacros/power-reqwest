@@ -1,3 +1,4 @@
+#![feature(ip)]
 mod expand;
 mod model;
 mod parse;
