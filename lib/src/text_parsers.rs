@@ -13,7 +13,7 @@ pub mod url_parser {
         AsChar, IResult, InputTakeAtPosition,
     };
     use proc_macro2::Span;
-    use syn::{LitInt, Token};
+    use syn::LitInt;
     use syn_prelude::{ToErr, ToExpr, ToIdent, ToLitStr, ToSynError};
 
     use crate::{
@@ -122,16 +122,13 @@ pub mod url_parser {
                 .map(|Param { name, value }| {
                     let mut default = None;
                     let expr = if let Some(value) = value {
-                        Some((
-                            Token![=](span),
-                            match value {
-                                Segment::CodePoints(s) => {
-                                    default = Some((s, span).to_lit_str().to_expr());
-                                    Expr::Constant(Constant::String((s, span).to_lit_str()))
-                                }
-                                Segment::Variable(v) => Expr::Variable(v.to_variable(span)),
-                            },
-                        ))
+                        Some(match value {
+                            Segment::CodePoints(s) => {
+                                default = Some((s, span).to_lit_str().to_expr());
+                                Expr::Constant(Constant::String((s, span).to_lit_str()))
+                            }
+                            Segment::Variable(v) => Expr::Variable(v.to_variable(span)),
+                        })
                     } else {
                         None
                     };
@@ -139,7 +136,7 @@ pub mod url_parser {
                         name: (name, span).to_lit_str(),
                         field_name: (name.to_case(Case::Snake), span).to_ident(),
                         optional: None,
-                        typ: (),
+                        typ: None,
                         alias: None,
                         expr,
                         default,

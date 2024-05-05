@@ -1,23 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use proc_macro2::Span;
 use syn::{
-    parse::{Parse, ParseStream},
+    parse::ParseStream,
     punctuated::Punctuated,
     token::{Brace, Bracket, Paren},
     ExprRange, Ident, LitBool, LitFloat, LitInt, LitStr, Token,
 };
 
-pub type ClientParams = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
-
 #[derive(Clone, Debug)]
 pub struct Client {
     pub name: Ident,
-    pub options: Option<ClientParams>,
+    pub options: Option<BracedConfig>,
     pub hooks: Option<Hooks>,
-    pub auth: Option<Auth>,
-    pub signing: Option<Signing>,
     pub apis: Vec<Api>,
+    pub templates: HashMap<Ident, DataTemplate>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,15 +24,16 @@ pub struct Hooks {
 }
 
 #[derive(Clone, Debug)]
-pub struct Signing {
-    pub(crate) span: Span,
-    pub sign_fn: Option<syn::Path>,
+pub struct DataTemplates {
+    pub templates: Vec<DataTemplate>,
 }
 
 #[derive(Clone, Debug)]
-pub struct Auth {
+pub struct DataTemplate {
     pub(crate) span: Span,
-    pub url: LitStr,
+    pub name: Ident,
+    pub extend: Option<Ident>,
+    pub fields: BracedConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -84,44 +82,41 @@ pub enum ApiUriSeg {
 
 #[derive(Clone, Debug)]
 pub struct ApiUriQuery {
-    pub fields: Vec<Field<(), (), (Token![=], Expr)>>,
+    pub fields: Vec<Field>,
 }
-
-pub type RequestHeaders = BracedConfig<(), (), (Token![=], Expr)>;
-pub type RequestQueries = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
-pub type RequestForm = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
-pub type RequestJson = BracedConfig<Type<(), (Token![=], Expr)>, (), (Token![=], Expr)>;
 
 #[derive(Clone, Debug)]
 pub struct ApiRequest {
     pub brace: Brace,
-    pub header: Option<RequestHeaders>,
-    pub query: Option<RequestQueries>,
-    pub form: Option<RequestForm>,
-    pub json: Option<RequestJson>,
+    pub header: Option<BracedConfig>,
+    pub header_var: Option<Ident>,
+    pub query: Option<BracedConfig>,
+    pub query_var: Option<Ident>,
+    pub data: Option<ApiRequestData>,
 }
 
-pub type ResponseHeaders = BracedConfig<(), (Token![->], Ident), ()>;
-pub type ResponseCookies = BracedConfig<(), (Token![->], Ident), ()>;
-pub type ResponseJson = BracedConfig<Type<(Token![->], Ident), ()>, (Token![->], Ident), ()>;
-pub type ResponseForm = BracedConfig<Type<(Token![->], Ident), ()>, (Token![->], Ident), ()>;
+#[derive(Clone, Debug)]
+pub struct ApiRequestData {
+    pub extend: Option<Ident>,
+    pub data_type: RequstDataType,
+    pub data: BracedConfig,
+    pub data_var: Option<Ident>,
+}
+
+#[derive(Clone, Debug)]
+pub enum RequstDataType {
+    Json(Span),
+    Form(Span),
+    Urlencoded(Span),
+}
 
 #[derive(Clone, Debug)]
 pub struct ApiResponse {
     pub brace: Brace,
-    pub header: Option<ResponseHeaders>,
-    pub cookie: Option<ResponseCookies>,
-    pub json: Option<ResponseJson>,
-    pub form: Option<ResponseForm>,
-}
-
-pub trait AsFieldType<A, X> {
-    fn peek(input: ParseStream) -> syn::Result<()>;
-    fn parse_type(input: ParseStream) -> syn::Result<Self>
-    where
-        Self: Sized;
-    fn as_type(&self) -> Option<&Type<A, X>>;
-    fn as_type_mut(&mut self) -> Option<&mut Type<A, X>>;
+    pub header: Option<BracedConfig>,
+    pub cookie: Option<BracedConfig>,
+    pub json: Option<BracedConfig>,
+    pub form: Option<BracedConfig>,
 }
 
 pub trait TryParse {
@@ -130,113 +125,31 @@ pub trait TryParse {
         Self: Sized;
 }
 
-pub trait AsFieldAlias: TryParse {
-    fn as_alias(&self) -> Option<&Ident>;
-}
-
-pub trait AsFieldAssignment: TryParse {
-    fn as_assignment(&self) -> Option<&Expr>;
-}
-
-impl<A, X> AsFieldType<A, X> for () {
-    fn peek(_input: ParseStream) -> syn::Result<()> {
-        Ok(())
-    }
-    fn parse_type(_input: ParseStream) -> syn::Result<Self> {
-        Ok(())
-    }
-
-    fn as_type(&self) -> Option<&Type<A, X>> {
-        None
-    }
-
-    fn as_type_mut(&mut self) -> Option<&mut Type<A, X>> {
-        None
-    }
-}
-
-impl TryParse for () {
-    fn try_parse(_input: ParseStream) -> syn::Result<Option<Self>> {
-        Ok(Some(()))
-    }
-}
-
-impl AsFieldAlias for () {
-    fn as_alias(&self) -> Option<&Ident> {
-        None
-    }
-}
-
-impl AsFieldAssignment for () {
-    fn as_assignment(&self) -> Option<&Expr> {
-        None
-    }
-}
-
-impl<T: Parse> TryParse for (Token![->], T) {
-    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if input.peek(Token![->]) {
-            let arrow = input.parse::<Token![->]>()?;
-            Ok(Some((arrow, input.parse()?)))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl AsFieldAlias for (Token![->], Ident) {
-    fn as_alias(&self) -> Option<&Ident> {
-        Some(&self.1)
-    }
-}
-
-impl<T: Parse> TryParse for (Token![=], T) {
-    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if input.peek(Token![=]) {
-            let arrow = input.parse::<Token![=]>()?;
-            Ok(Some((arrow, input.parse()?)))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl AsFieldAssignment for (Token![=], Expr) {
-    fn as_assignment(&self) -> Option<&Expr> {
-        Some(&self.1)
-    }
-}
-
 #[derive(Clone, Debug)]
-pub struct BracedConfig<T, A, X> {
+pub struct BracedConfig {
     pub token: Span,
     pub struct_name: Ident,
     pub brace: Brace,
-    pub fields: Vec<Field<T, A, X>>,
+    pub fields: Vec<Field>,
+    pub removed_fields: HashSet<LitStr>,
 }
 
 #[derive(Clone, Debug)]
-pub enum Type<A, X> {
+pub enum Type {
     Constant(Constant),
     String(StringType),
     Bool(Span),
     Integer(IntegerType),
     Float(FloatType),
-    Object(ObjectType<A, X>),
+    Object(ObjectType),
     Datetime(DateTimeType),
-    JsonText(JsonStringType<A, X>),
+    JsonText(JsonStringType),
     Map(Span),
-    List(ListType<A, X>),
+    List(ListType),
 }
 
-impl<A, X> Type<A, X> {
-    pub fn pure(&self) -> Type<(), ()> {
+impl Type {
+    pub fn pure(&self) -> Type {
         match self {
             Type::Constant(c) => Type::Constant(c.clone()),
             Type::String(s) => Type::String(s.clone()),
@@ -262,8 +175,8 @@ impl<A, X> Type<A, X> {
     }
 }
 
-impl<A1, X1, A2, X2> PartialEq<Type<A2, X2>> for Type<A1, X1> {
-    fn eq(&self, other: &Type<A2, X2>) -> bool {
+impl PartialEq<Type> for Type {
+    fn eq(&self, other: &Type) -> bool {
         match (self, other) {
             (Self::Constant(l0), Type::Constant(r0)) => l0 == r0,
             (Self::String(_), Type::String(_)) => true,
@@ -340,14 +253,14 @@ pub struct DateTimeFormat {
 }
 
 #[derive(Clone, Debug)]
-pub struct JsonStringType<A, X> {
+pub struct JsonStringType {
     pub span: Span,
     pub paren: Paren,
-    pub typ: Box<Type<A, X>>,
+    pub typ: Box<Type>,
 }
 
-impl<A, X> JsonStringType<A, X> {
-    pub fn pure(&self) -> JsonStringType<(), ()> {
+impl JsonStringType {
+    pub fn pure(&self) -> JsonStringType {
         JsonStringType {
             span: self.span,
             paren: self.paren,
@@ -357,22 +270,20 @@ impl<A, X> JsonStringType<A, X> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ListType<A, X> {
+pub struct ListType {
     pub bracket: Bracket,
-    pub element_type: Box<Type<A, X>>,
+    pub element_type: Box<Type>,
 }
-
-pub type ObjectField<A, X> = Field<Type<A, X>, A, X>;
 
 #[derive(Clone, Debug)]
-pub struct ObjectType<A, X> {
+pub struct ObjectType {
     pub struct_name: Ident,
     pub brace: Brace,
-    pub fields: Vec<ObjectField<A, X>>,
+    pub fields: Vec<Field>,
 }
 
-impl<A, X> ObjectType<A, X> {
-    pub fn pure(&self) -> ObjectType<(), ()> {
+impl ObjectType {
+    pub fn pure(&self) -> ObjectType {
         ObjectType {
             struct_name: self.struct_name.clone(),
             brace: self.brace,
@@ -391,7 +302,7 @@ impl<A, X> ObjectType<A, X> {
                         name: name.clone(),
                         field_name: field_name.clone(),
                         optional: optional.clone(),
-                        typ: typ.pure(),
+                        typ: typ.as_ref().map(|typ| typ.pure()),
                         alias: None,
                         expr: None,
                         default: default.clone(),
@@ -402,20 +313,20 @@ impl<A, X> ObjectType<A, X> {
     }
 }
 
-impl<A1, X1, A2, X2> PartialEq<ObjectType<A2, X2>> for ObjectType<A1, X1> {
-    fn eq(&self, other: &ObjectType<A2, X2>) -> bool {
+impl PartialEq<ObjectType> for ObjectType {
+    fn eq(&self, other: &ObjectType) -> bool {
         self.struct_name.eq(&other.struct_name)
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Field<T, A, X> {
+pub struct Field {
     pub name: LitStr,
     pub field_name: Ident,
     pub optional: Option<Span>,
-    pub typ: T,
-    pub alias: Option<A>,
-    pub expr: Option<X>,
+    pub typ: Option<Type>,
+    pub alias: Option<Ident>,
+    pub expr: Option<Expr>,
     pub default: Option<syn::Expr>,
 }
 
@@ -435,13 +346,14 @@ pub enum Expr {
     Timestamp(UnixTimestampUintFn),
     Join(JoinStringFn),
     Or(OrExpr),
+    Default(Span),
 }
 
 #[derive(Clone, Debug)]
 pub struct Variable {
     pub dollar: Span,
     pub name: Ident,
-    pub typ: Option<Type<(), ()>>,
+    pub typ: Option<Type>,
     pub client_option: bool,
 }
 

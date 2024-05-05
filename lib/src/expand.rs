@@ -59,7 +59,7 @@ impl ToTokens for Client {
     }
 }
 
-impl<A: AsFieldAlias, X: TryParse> Type<A, X> {
+impl Type {
     fn to_type(&self) -> syn::Type {
         match self {
             Self::Constant(c) => c.infer_type(),
@@ -140,10 +140,8 @@ impl Api {
             ..
         } = self;
 
-        let mut types = if let Some(json) = &request.json {
-            json.gen_obj_structs()
-        } else if let Some(form) = &request.form {
-            form.gen_obj_structs()
+        let mut types = if let Some(data) = &request.data {
+            data.data.gen_obj_structs()
         } else {
             vec![]
         };
@@ -189,10 +187,7 @@ impl Api {
     }
 }
 
-fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment>(
-    name: &Ident,
-    fields: &Vec<Field<T, A, X>>,
-) -> TokenStream {
+fn make_object_struct(name: &Ident, fields: &Vec<Field>) -> TokenStream {
     let fields_in_struct = fields.iter().map(
         |Field {
              name,
@@ -201,7 +196,7 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
              typ,
              ..
          }| {
-            let mut field_type = if let Some(typ) = typ.as_type() {
+            let mut field_type = if let Some(typ) = typ {
                 typ.to_type()
             } else {
                 syn::Path::from_ident(("String", name.span())).to_type()
@@ -220,7 +215,7 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
             if let Some(Type::Datetime(DateTimeType {
                 format: Some(DateTimeFormat { mod_name, .. }),
                 ..
-            })) = typ.as_type()
+            })) = typ
             {
                 let formatter = mod_name.to_lit_str();
                 if let Some(options) = serde_options.as_mut() {
@@ -258,7 +253,7 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
         if let Some(Type::Datetime(DateTimeType {
             format: Some(format),
             ..
-        })) = typ.as_type()
+        })) = typ
         {
             Some(format.gen_serde_formatter())
         } else {
@@ -282,13 +277,13 @@ fn make_object_struct<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignmen
     }
 }
 
-impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T, A, X> {
+impl BracedConfig {
     fn gen_obj_structs(&self) -> Vec<TokenStream> {
         let mut types = self
             .fields
             .iter()
             .filter_map(|f| {
-                if let Some(typ) = f.typ.as_type() {
+                if let Some(typ) = &f.typ {
                     typ.gen_obj_structs()
                 } else {
                     None
@@ -302,7 +297,7 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T
     }
 }
 
-impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
+impl Type {
     fn gen_obj_structs(&self) -> Option<Vec<TokenStream>> {
         match self {
             Self::Object(obj) => Some(obj.gen_obj_structs()),
@@ -319,12 +314,13 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
     }
 }
 
-impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
+impl ObjectType {
     fn gen_obj_structs(&self) -> Vec<TokenStream> {
         let mut types = self
             .fields
             .iter()
-            .filter_map(|f| f.typ.gen_obj_structs())
+            .filter_map(|f| f.typ.as_ref().map(|t| t.gen_obj_structs()))
+            .flatten()
             .flatten()
             .collect::<Vec<_>>();
         types.insert(0, make_object_struct(&self.struct_name, &self.fields));

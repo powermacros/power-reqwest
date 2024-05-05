@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use convert_case::{Case, Casing};
 use proc_macro2::Span;
 use syn::{
-    parse::{Parse, ParseBuffer, ParseStream},
+    parse::{discouraged::Speculative, Parse, ParseBuffer, ParseStream},
     punctuated::Punctuated,
     spanned::Spanned,
     token::Paren,
@@ -24,9 +24,8 @@ impl Parse for Client {
             name: Ident::new("_", whole_span),
             options: None,
             hooks: None,
-            auth: None,
-            signing: None,
             apis: vec![],
+            templates: HashMap::new(),
         };
         while !input.is_empty() {
             if input.try_parse_comma().is_some() || input.try_parse_semi().is_some() {
@@ -51,30 +50,32 @@ impl Parse for Client {
                         .to_err()?;
                 }
                 input.try_parse_colon();
-                let params = ClientParams::parse(input, ident.span())?;
+                let params = BracedConfig::parse(input, ident.span(), true, false, true)?;
                 for field in params.fields.iter() {
                     field.requires_to_simple_type()?;
                     field.check_constant_expr_with_type()?;
                 }
                 client.options = Some(params);
-            } else if let Some(signing) = Signing::try_parse(input)? {
-                if let Some(prev) = &client.signing {
-                    (signing.span, prev.span)
-                        .to_span()
-                        .to_syn_error("duplicated signature config")
-                        .to_err()?;
+            } else if let Some(templates) = DataTemplates::try_parse(input)? {
+                for template in templates.templates.into_iter() {
+                    if let Some(prev) = client.templates.get(&template.name) {
+                        (template.span, prev.span)
+                            .to_span()
+                            .to_syn_error("duplicated object template")
+                            .to_err()?;
+                    } else {
+                        client.templates.insert(template.name.clone(), template);
+                    }
                 }
-                input.try_parse_colon();
-                client.signing = Some(signing);
-            } else if let Some(auth) = Auth::try_parse(input)? {
-                if let Some(prev) = &client.auth {
-                    (auth.span, prev.span)
+            } else if let Some(template) = DataTemplate::try_parse(input)? {
+                if let Some(prev) = client.templates.get(&template.name) {
+                    (template.span, prev.span)
                         .to_span()
-                        .to_syn_error("duplicated authorization config")
+                        .to_syn_error("duplicated object template")
                         .to_err()?;
+                } else {
+                    client.templates.insert(template.name.clone(), template);
                 }
-                input.try_parse_colon();
-                client.auth = Some(auth);
             } else if let Some(hooks) = Hooks::try_parse(input)? {
                 if let Some(prev) = &client.hooks {
                     (hooks.span, prev.span)
@@ -95,19 +96,39 @@ impl Parse for Client {
         if let Some(options) = client.options.as_mut() {
             options.struct_name = client.name.with_suffix("Options");
         }
+
+        for api in client.apis.iter_mut() {
+            api.extend_templates(&client.templates)?;
+        }
+
         client.resolve_object_type_names()?;
 
         let option_map = if let Some(options) = &client.options {
             options
                 .fields
                 .iter()
-                .map(|f| (&f.field_name, &f.typ))
+                .map(|f| (&f.field_name, f.typ.as_ref()))
                 .collect::<HashMap<_, _>>()
         } else {
             HashMap::new()
         };
+
+        for (name, template) in client.templates.iter() {
+            let mut extends = vec![];
+            if template.check_recycle_ref(&client.templates, &mut extends)? {
+                extends.insert(0, name);
+                extends
+                    .into_iter()
+                    .map(|x| x.span())
+                    .collect::<Vec<_>>()
+                    .to_span()
+                    .to_syn_error("cannot extend template back to self")
+                    .to_err()?;
+            }
+        }
+
         for api in client.apis.iter_mut() {
-            api.check_and_update_with_client_option_vars(&option_map)?;
+            api.collect_and_check_vars(&option_map)?;
         }
 
         Ok(client)
@@ -118,10 +139,8 @@ impl Client {
     fn resolve_object_type_names(&mut self) -> syn::Result<()> {
         for api in self.apis.iter_mut() {
             let prefix = api.name.to_ident_with_case(Case::UpperCamel);
-            if let Some(json) = &mut api.request.json {
-                json.resolve_types(prefix.with_suffix("RequestData"))?;
-            } else if let Some(form) = &mut api.request.form {
-                form.resolve_types(prefix.with_suffix("RequestData"))?;
+            if let Some(data) = &mut api.request.data {
+                data.data.resolve_types(prefix.with_suffix("RequestData"))?;
             };
             if let Some(headers) = &mut api.request.header {
                 headers.resolve_types(prefix.with_suffix("RequestHeaders"))?;
@@ -179,80 +198,74 @@ impl Hooks {
     }
 }
 
-impl Signing {
+impl DataTemplates {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(_ident) = input.try_parse_one_of_idents(("signing", "signature")) {
+        if let Some(ident) = input.try_parse_as_ident("templates", false) {
             input.parse::<Token![:]>()?;
             let inner: ParseBuffer;
-            let brace = syn::braced!(inner in input);
-            let mut sign = Signing {
-                span: brace.span.close(),
-                sign_fn: Default::default(),
-            };
+            syn::braced!(inner in input);
+            let mut templates = DataTemplates { templates: vec![] };
             while !inner.is_empty() {
                 if let Some(_) = inner.try_parse_comma() {
                     continue;
                 }
-
-                if let Some(_sign_token) = inner.try_parse_as_ident("sign", false) {
-                    if sign.sign_fn.is_some() {
-                        _sign_token
-                            .span()
-                            .to_syn_error("duplicate sign before")
-                            .to_err()?;
-                    }
-                    inner.parse::<Token![:]>()?;
-                    sign.sign_fn = Some(inner.parse()?);
-                } else {
-                    inner
-                        .span()
-                        .to_syn_error("unxpected signing field")
-                        .to_err()?;
-                }
+                templates
+                    .templates
+                    .push(DataTemplate::parse(&inner, ident.span())?);
             }
-            //
-            Ok(Some(sign))
+            Ok(Some(templates))
         } else {
             Ok(None)
         }
     }
 }
 
-impl Auth {
-    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
-        if let Some(_ident) = input.try_parse_one_of_idents(("auth", "authorization")) {
-            input.parse::<Token![:]>()?;
-            let inner: ParseBuffer;
-            let brace = syn::braced!(inner in input);
-
-            let mut url = None;
-
-            while !inner.is_empty() {
-                if let Some(_) = inner.try_parse_comma() {
-                    continue;
-                }
-
-                if let Some(_url) = inner.try_parse_as_ident("url", false) {
-                    inner.parse::<Token![:]>()?;
-                    if url.is_some() {
-                        _url.to_syn_error("duplicated url config").to_err()?;
-                    }
-                    url = Some(inner.parse::<LitStr>()?);
-                } else {
-                    inner
-                        .span()
-                        .to_syn_error("unexpected authorization field")
-                        .to_err()?;
-                }
+impl DataTemplate {
+    fn parse(input: ParseStream, token_span: Span) -> syn::Result<Self> {
+        let name = input.parse::<Ident>()?;
+        let extend = if let Some(_colon) = input.try_parse_colon() {
+            if input.peek(Ident) {
+                Some(input.parse()?)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        let template = BracedConfig::parse(input, name.span(), true, true, true)?;
+        Ok(Self {
+            span: token_span,
+            name,
+            extend,
+            fields: template,
+        })
+    }
 
-            let span = brace.span.close();
-            Ok(Some(Self {
-                span,
-                url: url.ok_or(span.to_syn_error("missing authorization url"))?,
-            }))
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(template) = input.try_parse_as_ident("template", false) {
+            Ok(Some(Self::parse(input, template.span())?))
         } else {
             Ok(None)
+        }
+    }
+
+    fn check_recycle_ref<'a>(
+        &'a self,
+        templates: &'a HashMap<Ident, Self>,
+        path: &mut Vec<&'a Ident>,
+    ) -> syn::Result<bool> {
+        if path.contains(&&self.name) {
+            return Ok(true);
+        }
+        if let Some(extend) = &self.extend {
+            if let Some(next) = templates.get(extend) {
+                path.push(extend);
+                next.check_recycle_ref(templates, path)
+            } else {
+                extend.to_syn_error("no such template").to_err()
+            }
+        } else {
+            Ok(false)
         }
     }
 }
@@ -291,9 +304,18 @@ impl Api {
         }
     }
 
-    fn check_and_update_with_client_option_vars(
+    fn extend_templates(&mut self, templates: &HashMap<Ident, DataTemplate>) -> syn::Result<()> {
+        if let Some(data) = &mut self.request.data {
+            if let Some(extend) = &data.extend {
+                data.data.extend_templates(extend, templates)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_and_check_vars(
         &mut self,
-        options: &HashMap<&Ident, &Type<(), (Token![=], Expr)>>,
+        options: &HashMap<&Ident, Option<&Type>>,
     ) -> syn::Result<()> {
         self.uri.collect_vars(&mut self.variables)?;
         self.request.collect_vars(&mut self.variables)?;
@@ -302,14 +324,16 @@ impl Api {
             if var.client_option {
                 if let Some(opt_type) = options.get(&var.name) {
                     if let Some(typ) = &var.typ {
-                        if opt_type.ne(&typ) {
-                            (typ.to_span(), opt_type.to_span())
-                                .to_span()
-                                .to_syn_error("unmatched type with client option")
-                                .to_err()?;
+                        if let Some(opt_type) = opt_type {
+                            if opt_type.ne(&typ) {
+                                (typ.to_span(), opt_type.to_span())
+                                    .to_span()
+                                    .to_syn_error("unmatched type with client option")
+                                    .to_err()?;
+                            }
                         }
                     } else {
-                        var.typ = Some(opt_type.pure());
+                        var.typ = opt_type.map(|t| t.pure());
                     }
                 } else {
                     var.name.to_syn_error("no such option").to_err()?;
@@ -344,28 +368,28 @@ impl Parse for ApiUri {
 impl ApiUri {
     fn collect_vars(&self, variables: &mut Vec<Variable>) -> syn::Result<()> {
         for var in self.uri_variables.iter() {
-            variables.collect::<(), (), ()>(var, &())?;
+            variables.collect(var, None)?;
         }
         if let Some(var) = &self.port_var {
-            variables.collect::<Type<(), ()>, (), ()>(
+            variables.collect(
                 var,
-                &Type::Integer(IntegerType {
+                Some(&Type::Integer(IntegerType {
                     token: ("u16", var.name.span()).to_ident(),
                     limits: None,
-                }),
+                })),
             )?;
         }
         if let Some(path) = &self.uri_path {
             for seg in path.segments.iter() {
                 if let ApiUriSeg::Var(var) = seg {
-                    variables.collect::<(), (), ()>(var, &())?;
+                    variables.collect(var, None)?;
                 }
             }
         }
         if let Some(query) = &self.uri_query {
             for field in query.fields.iter() {
-                if let Some((_, Expr::Variable(var))) = &field.expr {
-                    variables.collect::<(), (), ()>(var, &())?;
+                if let Some(Expr::Variable(var)) = &field.expr {
+                    variables.collect(var, None)?;
                 }
             }
         }
@@ -381,8 +405,9 @@ impl ApiRequest {
             brace,
             header: None,
             query: None,
-            form: None,
-            json: None,
+            data: None,
+            header_var: None,
+            query_var: None,
         };
 
         while !inner.is_empty() {
@@ -390,16 +415,14 @@ impl ApiRequest {
                 continue;
             }
 
-            if let Some(json) = inner.try_parse_as_ident("json", false) {
-                if let Some(prev) = request.json {
-                    (json.span(), prev.token)
+            if let Some(data) = ApiRequestData::try_parse(&inner)? {
+                if let Some(prev) = &request.data {
+                    (data.data.token, prev.data.token)
                         .to_span()
                         .to_syn_error("duplicated json config")
                         .to_err()?;
                 }
-                inner.try_parse_colon();
-                let json = RequestJson::parse(input, json.span())?;
-                request.json = Some(json);
+                request.data = Some(data);
             } else if let Some(query) = inner.try_parse_as_ident("query", false) {
                 if let Some(prev) = request.query {
                     (query.span(), prev.token)
@@ -408,18 +431,14 @@ impl ApiRequest {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                let query = RequestQueries::parse(&inner, query.span())?;
-                request.query = Some(query);
-            } else if let Some(form) = inner.try_parse_as_ident("form", false) {
-                if let Some(prev) = &request.form {
-                    (form.span(), prev.token)
-                        .to_span()
-                        .to_syn_error("duplicated form config")
-                        .to_err()?;
-                }
-                inner.try_parse_colon();
-                let form = RequestForm::parse(&inner, form.span())?;
-                request.form = Some(form);
+                request.query = Some(BracedConfig::parse(
+                    &inner,
+                    query.span(),
+                    true,
+                    false,
+                    true,
+                )?);
+                request.query_var = Self::parse_var_part(&inner)?;
             } else if let Some(header) = inner.try_parse_as_ident("header", false) {
                 if let Some(prev) = &request.header {
                     (header.span(), prev.token)
@@ -428,8 +447,14 @@ impl ApiRequest {
                         .to_err()?;
                 }
                 input.try_parse_colon();
-                let header = RequestHeaders::parse(&inner, header.span())?;
-                request.header = Some(header);
+                request.header = Some(BracedConfig::parse(
+                    &inner,
+                    header.span(),
+                    false,
+                    false,
+                    true,
+                )?);
+                request.header_var = Self::parse_var_part(&inner)?;
             } else {
                 inner
                     .span()
@@ -440,41 +465,78 @@ impl ApiRequest {
 
         Ok(request)
     }
+    fn parse_var_part(input: ParseStream) -> syn::Result<Option<Ident>> {
+        Ok(if let Some(_) = input.try_parse_eq() {
+            input.parse::<Token![$]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        })
+    }
 
     fn collect_vars(&self, vars: &mut Vec<Variable>) -> syn::Result<()> {
         if let Some(header) = &self.header {
-            header.collect_vars(vars)?;
+            header.collect_vars(vars, &self.header_var)?;
         }
         if let Some(query) = &self.query {
-            query.collect_vars(vars)?;
+            query.collect_vars(vars, &self.query_var)?;
         }
-        if let Some(json) = &self.json {
-            json.collect_vars(vars)?;
-        }
-        if let Some(form) = &self.form {
-            form.collect_vars(vars)?;
+        if let Some(data) = &self.data {
+            data.data.collect_vars(vars, &data.data_var)?;
         }
         Ok(())
     }
 }
 
+impl ApiRequestData {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) =
+            input.try_parse_one_of_idents(("json", "form", "urlencoded", "urlencode", "urlenc"))
+        {
+            let extend = if let Some(_colon) = input.try_parse_colon() {
+                if input.peek(Ident) {
+                    Some(input.parse()?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let data = BracedConfig::parse(input, ident.span(), true, true, true)?;
+            let data_var = ApiRequest::parse_var_part(input)?;
+            Ok(Some(Self {
+                extend,
+                data_type: match ident.to_string().as_str() {
+                    "json" => RequstDataType::Json(ident.span()),
+                    "form" => RequstDataType::Form(ident.span()),
+                    "urlencoded" | "urlencode" | "urlenc" => {
+                        RequstDataType::Urlencoded(ident.span())
+                    }
+                    _ => {
+                        unreachable!()
+                    }
+                },
+                data,
+                data_var,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 trait VariableCollector {
-    fn collect<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment>(
-        &mut self,
-        var: &Variable,
-        suggested_type: &T,
-    ) -> syn::Result<()>;
+    fn collect(&mut self, var: &Variable, suggested_type: Option<&Type>) -> syn::Result<()>;
 }
 
 impl VariableCollector for Vec<Variable> {
-    fn collect<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment>(
-        &mut self,
-        var: &Variable,
-        suggested_type: &T,
-    ) -> syn::Result<()> {
+    fn collect(&mut self, var: &Variable, suggested_type: Option<&Type>) -> syn::Result<()> {
+        if var.client_option {
+            return Ok(());
+        }
         if let Some(old) = self.iter().find(|old| old.name.eq(&var.name)) {
             if let Some(old_type) = &old.typ {
-                if let Some(typ) = suggested_type.as_type() {
+                if let Some(typ) = suggested_type {
                     // compare type
                     if typ.ne(old_type) {
                         (typ.to_span(), old_type.to_span())
@@ -489,7 +551,7 @@ impl VariableCollector for Vec<Variable> {
                         .to_syn_error("expect string type for the variable")
                         .to_err()?;
                 }
-            } else if let Some(typ) = suggested_type.as_type() {
+            } else if let Some(typ) = suggested_type {
                 // check new type whether is string
                 if !typ.is_string() {
                     (typ.to_span(), old.name.span())
@@ -501,7 +563,7 @@ impl VariableCollector for Vec<Variable> {
         }
         let mut var = var.clone();
         if var.typ.is_none() {
-            var.typ = suggested_type.as_type().map(|t| t.pure())
+            var.typ = suggested_type.map(|t| t.pure())
         }
         self.push(var);
         Ok(())
@@ -533,7 +595,7 @@ impl Parse for ApiResponse {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                response.json = Some(ResponseJson::parse(&inner, json.span())?);
+                response.json = Some(BracedConfig::parse(&inner, json.span(), true, true, false)?);
             } else if let Some(form) = inner.try_parse_as_ident("form", false) {
                 if let Some(prev) = &response.form {
                     (form.span(), prev.token)
@@ -542,7 +604,7 @@ impl Parse for ApiResponse {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                response.form = Some(ResponseForm::parse(&inner, form.span())?);
+                response.form = Some(BracedConfig::parse(&inner, form.span(), true, true, false)?);
             } else if let Some(cookie) = inner.try_parse_as_ident("cookie", false) {
                 if let Some(prev) = &response.cookie {
                     (cookie.span(), prev.token)
@@ -551,7 +613,13 @@ impl Parse for ApiResponse {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                response.cookie = Some(ResponseCookies::parse(&inner, cookie.span())?);
+                response.cookie = Some(BracedConfig::parse(
+                    &inner,
+                    cookie.span(),
+                    false,
+                    true,
+                    false,
+                )?);
             } else if let Some(header) = inner.try_parse_as_ident("header", false) {
                 if let Some(prev) = &response.header {
                     (header.span(), prev.token)
@@ -560,7 +628,13 @@ impl Parse for ApiResponse {
                         .to_err()?;
                 }
                 inner.try_parse_colon();
-                response.header = Some(ResponseHeaders::parse(&inner, header.span())?);
+                response.header = Some(BracedConfig::parse(
+                    &inner,
+                    header.span(),
+                    false,
+                    true,
+                    false,
+                )?);
             } else {
                 inner
                     .span()
@@ -573,29 +647,60 @@ impl Parse for ApiResponse {
     }
 }
 
-impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T, A, X> {
-    fn parse(input: ParseStream, token: Span) -> syn::Result<Self> {
+impl BracedConfig {
+    fn parse(
+        input: ParseStream,
+        token: Span,
+        parse_type: bool,
+        parse_alias: bool,
+        parse_assignment: bool,
+    ) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let brace = syn::braced!(inner in input);
-        let mut fields: Vec<Field<T, A, X>> = vec![];
+        let mut fields: Vec<Field> = vec![];
+        let mut removed_fields = HashSet::new();
         while !inner.is_empty() {
             if let Some(_) = inner.try_parse_comma() {
                 continue;
             }
-            let field: Field<T, A, X> = inner.parse()?;
-            if let Some(prev) = fields.iter().find(|f| f.field_name.eq(&field.field_name)) {
-                (field.name.span(), prev.name.span())
-                    .to_span()
-                    .to_syn_error("duplicated field")
-                    .to_err()?;
+            let mut removal = false;
+            if inner.peek(Token![-]) {
+                inner.parse::<Token![-]>()?;
+                removal = true;
             }
-            fields.push(field);
+            if removal {
+                let fork = inner.fork();
+                let result = Field::parse(&fork, parse_type, parse_alias, parse_assignment);
+                if result.is_err() {
+                    removed_fields.insert(inner.parse_as_lit_str()?);
+                } else {
+                    let field: Field = result?;
+                    if let Some(prev) = fields.iter().find(|f| f.field_name.eq(&field.field_name)) {
+                        (field.name.span(), prev.name.span())
+                            .to_span()
+                            .to_syn_error("duplicated field")
+                            .to_err()?;
+                    }
+                    removed_fields.insert(field.name);
+                    inner.advance_to(&fork);
+                }
+            } else {
+                let field: Field = Field::parse(&inner, parse_type, parse_alias, parse_assignment)?;
+                if let Some(prev) = fields.iter().find(|f| f.field_name.eq(&field.field_name)) {
+                    (field.name.span(), prev.name.span())
+                        .to_span()
+                        .to_syn_error("duplicated field")
+                        .to_err()?;
+                }
+                fields.push(field);
+            }
         }
         Ok(Self {
             token,
             struct_name: ("_", token).to_ident(),
             brace,
             fields,
+            removed_fields,
         })
     }
 
@@ -608,30 +713,83 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> BracedConfig<T
         Ok(())
     }
 
-    fn collect_vars<C: VariableCollector>(&self, vars: &mut C) -> syn::Result<()> {
+    fn extend_templates(
+        &mut self,
+        extend: &Ident,
+        templates: &HashMap<Ident, DataTemplate>,
+    ) -> syn::Result<()> {
+        if let Some(template) = templates.get(extend) {
+            for field in template.fields.fields.iter() {
+                if self.removed_fields.contains(&field.name) {
+                    continue;
+                }
+                if self
+                    .fields
+                    .iter()
+                    .find(|f| f.name.eq(&field.name))
+                    .is_some()
+                {
+                    continue;
+                }
+                self.fields.push(field.clone());
+            }
+            if let Some(extend) = &template.extend {
+                self.extend_templates(extend, templates)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_vars<C: VariableCollector>(
+        &self,
+        vars: &mut C,
+        outer_varname: &Option<Ident>,
+    ) -> syn::Result<()> {
+        let mut spans = vec![];
         for f in self.fields.iter() {
             if let Some(x) = &f.expr {
-                if let Some(x) = x.as_assignment() {
-                    x.collect_vars(vars, &f.typ)?;
+                x.collect_vars(vars, f.typ.as_ref())?;
+            } else {
+                if let Some(typ) = &f.typ {
+                    match typ {
+                        Type::Constant(_) => {}
+                        Type::Object(obj) => {
+                            if !obj.get_unassigned_fields(&mut spans) {
+                                spans.push(f.name.span());
+                            }
+                        }
+                        _ => {
+                            spans.push(f.name.span());
+                        }
+                    }
                 }
             }
-            if let Some(Type::Object(obj)) = f.typ.as_type() {
+            if let Some(Type::Object(obj)) = f.typ.as_ref() {
                 obj.collect_vars(vars)?;
+            }
+        }
+        if !spans.is_empty() {
+            if outer_varname.is_none() {
+                spans
+                    .to_span()
+                    .to_syn_error("missing variable to init fields")
+                    .to_err()?;
             }
         }
         Ok(())
     }
 }
 
-impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X> {
+impl Field {
     fn resolve_field_type(&mut self, prefix: &str) -> syn::Result<()> {
-        if let Some(typ) = self.typ.as_type_mut() {
+        if let Some(typ) = self.typ.as_mut() {
             match typ {
                 Type::Object(obj) => {
                     obj.resolve_type_name(&self.field_name, prefix, false)?;
                 }
                 Type::JsonText(JsonStringType { typ, .. }) => {
-                    if let Some(Type::Object(obj)) = typ.as_type_mut() {
+                    if let Type::Object(obj) = typ.as_mut() {
                         obj.resolve_type_name(&self.field_name, prefix, false)?;
                     }
                 }
@@ -657,7 +815,7 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X>
     }
 }
 
-impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
+impl ObjectType {
     fn resolve_type_name(
         &mut self,
         field_name: &Ident,
@@ -676,29 +834,48 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> ObjectType<A, X> {
 
     fn collect_vars<C: VariableCollector>(&self, vars: &mut C) -> syn::Result<()> {
         for f in self.fields.iter() {
-            if let Some(x) = &f.expr {
-                if let Some(Expr::Variable(var)) = x.as_assignment() {
-                    vars.collect(var, &f.typ)?;
-                }
+            if let Some(Expr::Variable(var)) = &f.expr {
+                vars.collect(var, f.typ.as_ref())?;
             }
-            if let Some(Type::Object(obj)) = f.typ.as_type() {
+            if let Some(Type::Object(obj)) = f.typ.as_ref() {
                 obj.collect_vars(vars)?;
             }
         }
         Ok(())
     }
+
+    fn get_unassigned_fields(&self, spans: &mut Vec<Span>) -> bool {
+        let mut has_unsignned = false;
+        for field in &self.fields {
+            if field.expr.is_none() {
+                if let Some(typ) = field.typ.as_ref() {
+                    match typ {
+                        Type::Constant(_) => {}
+                        Type::Object(obj) => {
+                            obj.get_unassigned_fields(spans);
+                        }
+                        _ => {
+                            has_unsignned = true;
+                            spans.push(field.name.span());
+                        }
+                    }
+                }
+            }
+        }
+        has_unsignned
+    }
 }
 
-impl<A: AsFieldAlias, X: AsFieldAssignment> Parse for ObjectType<A, X> {
+impl Parse for ObjectType {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let inner: ParseBuffer;
         let brace = syn::braced!(inner in input);
-        let mut fields: Vec<ObjectField<A, X>> = vec![];
+        let mut fields: Vec<Field> = vec![];
         while !inner.is_empty() {
             if let Some(_) = inner.try_parse_comma() {
                 continue;
             }
-            let field: ObjectField<A, X> = inner.parse()?;
+            let field = Field::parse(&inner, true, true, false)?;
             if let Some(prev) = fields.iter().find(|f| f.name.eq(&field.name)) {
                 (field.name.span(), prev.name.span())
                     .to_span()
@@ -714,7 +891,14 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> Parse for ObjectType<A, X> {
         })
     }
 }
-impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
+impl Type {
+    fn peek(input: ParseStream) -> syn::Result<()> {
+        if !input.peek(syn::token::Brace) {
+            input.parse::<Token![:]>()?;
+        }
+        Ok(())
+    }
+
     fn parse_basic(input: ParseStream) -> syn::Result<Self> {
         Ok(if input.peek(syn::token::Brace) {
             Self::Object(input.parse()?)
@@ -741,9 +925,29 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> Type<A, X> {
                 .to_err()?
         })
     }
+
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut typ = Type::parse_basic(input)?;
+        if input.peek(syn::token::Bracket) {
+            let inner: ParseBuffer;
+            let bracket = syn::bracketed!(inner in input);
+            if inner.is_empty() {
+                typ = Type::List(ListType {
+                    bracket,
+                    element_type: Box::new(typ),
+                });
+            } else {
+                inner
+                    .span()
+                    .to_syn_error("unexpect content for list type")
+                    .to_err()?;
+            }
+        }
+        Ok(typ)
+    }
 }
 
-impl<A, X> ToSpan for Type<A, X> {
+impl ToSpan for Type {
     fn to_span(&self) -> Span {
         match self {
             Self::Constant(c) => c.span(),
@@ -757,43 +961,6 @@ impl<A, X> ToSpan for Type<A, X> {
             Self::Map(s) => *s,
             Self::List(l) => (l.element_type.to_span(), l.bracket.span.close()).to_span(),
         }
-    }
-}
-
-impl<A: AsFieldAlias, X: AsFieldAssignment> AsFieldType<A, X> for Type<A, X> {
-    fn peek(input: ParseStream) -> syn::Result<()> {
-        if !input.peek(syn::token::Brace) {
-            input.parse::<Token![:]>()?;
-        }
-        Ok(())
-    }
-
-    fn parse_type(input: ParseStream) -> syn::Result<Self> {
-        let mut typ = Self::parse_basic(input)?;
-        if input.peek(syn::token::Bracket) {
-            let inner: ParseBuffer;
-            let bracket = syn::bracketed!(inner in input);
-            if inner.is_empty() {
-                typ = Self::List(ListType {
-                    bracket,
-                    element_type: Box::new(typ),
-                });
-            } else {
-                inner
-                    .span()
-                    .to_syn_error("unexpect content for list type")
-                    .to_err()?;
-            }
-        }
-        Ok(typ)
-    }
-
-    fn as_type(&self) -> Option<&Type<A, X>> {
-        Some(self)
-    }
-
-    fn as_type_mut(&mut self) -> Option<&mut Type<A, X>> {
-        Some(self)
     }
 }
 
@@ -916,7 +1083,7 @@ impl FloatLimits {
     }
 }
 
-impl<A: AsFieldAlias, X: AsFieldAssignment> TryParse for JsonStringType<A, X> {
+impl TryParse for JsonStringType {
     fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
         if let Some(json) = input.try_parse_one_of_idents(("json", "json_string")) {
             let inner: ParseBuffer;
@@ -924,7 +1091,7 @@ impl<A: AsFieldAlias, X: AsFieldAssignment> TryParse for JsonStringType<A, X> {
             Ok(Some(Self {
                 paren,
                 span: json.span(),
-                typ: Box::new(Type::parse_type(&inner)?),
+                typ: Box::new(Type::parse(&inner)?),
             }))
         } else {
             Ok(None)
@@ -962,26 +1129,48 @@ impl DateTimeType {
     }
 }
 
-impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Parse for Field<T, A, X> {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
+impl Field {
+    fn parse(
+        input: ParseStream,
+        parse_type: bool,
+        parse_alias: bool,
+        parse_assignment: bool,
+    ) -> syn::Result<Self> {
         let name = input.parse_as_lit_str()?;
-
         let optional = input.try_parse_question();
-        T::peek(input)?;
-        let typ = T::parse_type(input)?;
-        let alias = A::try_parse(input)?;
-        let expr = X::try_parse(input)?;
-        let mut field_name = if let Some(alias) = &alias {
-            if let Some(alias) = alias.as_alias() {
-                if alias.is_keyword() {
-                    alias
-                        .to_syn_error("alias name is reserved for rust language")
-                        .to_err()?;
-                }
-                alias.clone()
+
+        let typ = if parse_type {
+            Type::peek(input)?;
+            Some(Type::parse(input)?)
+        } else {
+            None
+        };
+        let alias = if parse_alias {
+            if input.peek(Token![->]) {
+                input.parse::<Token![->]>()?;
+                Some(input.parse::<Ident>()?)
             } else {
-                name.to_ident_with_case(Case::Snake)
+                None
             }
+        } else {
+            None
+        };
+        let expr = if parse_assignment {
+            if let Some(_eq) = input.try_parse_eq() {
+                Some(Expr::parse(input)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut field_name = if let Some(alias) = &alias {
+            if alias.is_keyword() {
+                alias
+                    .to_syn_error("alias name is reserved for rust language")
+                    .to_err()?;
+            }
+            alias.clone()
         } else {
             name.to_ident_with_case(Case::Snake)
         };
@@ -999,10 +1188,10 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Parse for Fiel
         }
 
         let mut default = None;
-        if let Some(Type::Constant(c)) = typ.as_type() {
+        if let Some(Type::Constant(c)) = typ.as_ref() {
             default = Some(c.to_value());
         } else if let Some(x) = &expr {
-            if let Some(Expr::Constant(c)) = x.as_assignment() {
+            if let Expr::Constant(c) = x {
                 default = Some(c.to_value());
             }
         }
@@ -1021,9 +1210,9 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Parse for Fiel
     }
 }
 
-impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X> {
+impl Field {
     fn requires_to_simple_type(&self) -> syn::Result<()> {
-        if let Some(t) = self.typ.as_type() {
+        if let Some(t) = self.typ.as_ref() {
             match t {
                 Type::Object(_) => t.to_span().to_syn_error("unsupported type").to_err(),
                 Type::Map(_) => t.to_span().to_syn_error("unsupported type").to_err(),
@@ -1035,22 +1224,20 @@ impl<T: AsFieldType<A, X>, A: AsFieldAlias, X: AsFieldAssignment> Field<T, A, X>
     }
 
     fn check_constant_expr_with_type(&self) -> syn::Result<()> {
-        if let (Some(t), Some(x)) = (self.typ.as_type(), self.expr.as_ref()) {
-            if let Some(x) = x.as_assignment() {
-                let okay = is_type_and_value_match(t, x);
-                if !okay {
-                    (t.to_span(), x.to_span())
-                        .to_span()
-                        .to_syn_error("unmatch type with value")
-                        .to_err()?;
-                }
+        if let (Some(t), Some(x)) = (self.typ.as_ref(), self.expr.as_ref()) {
+            let okay = is_type_and_value_match(t, x);
+            if !okay {
+                (t.to_span(), x.to_span())
+                    .to_span()
+                    .to_syn_error("unmatch type with value")
+                    .to_err()?;
             }
         }
         Ok(())
     }
 }
 
-fn is_type_and_constant_match<A, X>(t: &Type<A, X>, c: &Constant) -> bool {
+fn is_type_and_constant_match(t: &Type, c: &Constant) -> bool {
     match (t, c) {
         (Type::String(_), Constant::String(_)) => true,
         (Type::Integer(_), Constant::Int(_)) => true,
@@ -1060,7 +1247,7 @@ fn is_type_and_constant_match<A, X>(t: &Type<A, X>, c: &Constant) -> bool {
     }
 }
 
-fn is_type_and_value_match<A, X>(t: &Type<A, X>, x: &Expr) -> bool {
+fn is_type_and_value_match(t: &Type, x: &Expr) -> bool {
     match (t, x) {
         (Type::String(_), Expr::Json(_)) => true,
         (Type::String(_), Expr::Datetime(_)) => true,
@@ -1092,6 +1279,10 @@ impl Parse for Expr {
             Self::Join(string)
         } else if let Some(uint) = UnixTimestampUintFn::try_parse(input)? {
             Self::Timestamp(uint)
+        } else if let Some(ident) = input.try_parse_as_ident("default", false) {
+            let _paren: ParseBuffer;
+            let p = syn::parenthesized!(_paren in input);
+            Self::Default((ident.span(), p.span.close()).to_span())
         } else {
             Self::Constant(input.parse()?)
         };
@@ -1110,60 +1301,61 @@ impl ToSpan for Expr {
             Self::Timestamp(x) => x.to_span(),
             Self::Join(x) => x.to_span(),
             Self::Or(x) => x.to_span(),
+            Expr::Default(span) => *span,
         }
     }
 }
 
 impl Expr {
-    fn collect_vars<
-        T: AsFieldType<A, X>,
-        A: AsFieldAlias,
-        X: AsFieldAssignment,
-        C: VariableCollector,
-    >(
+    fn collect_vars<C: VariableCollector>(
         &self,
         vars: &mut C,
-        suggested_type: &T,
+        suggested_type: Option<&Type>,
     ) -> syn::Result<()> {
         match self {
             Expr::Variable(var) => {
                 vars.collect(var, suggested_type)?;
             }
             Expr::Datetime(call) => {
-                vars.collect::<Type<(), ()>, (), ()>(
+                vars.collect(
                     &call.variable,
-                    &Type::Datetime(DateTimeType {
+                    Some(&Type::Datetime(DateTimeType {
                         span: call.variable.name.span(),
                         format: None,
-                    }),
+                    })),
                 )?;
             }
             Expr::Json(call) => {
-                vars.collect::<Type<(), ()>, (), ()>(
-                    &call.variable,
-                    &Type::Map(call.variable.name.span()),
-                )?;
+                vars.collect(&call.variable, Some(&Type::Map(call.variable.name.span())))?;
             }
             Expr::Timestamp(call) => {
-                vars.collect::<Type<(), ()>, (), ()>(
+                vars.collect(
                     &call.variable,
-                    &Type::Datetime(DateTimeType {
+                    Some(&Type::Datetime(DateTimeType {
                         span: call.variable.name.span(),
                         format: None,
-                    }),
+                    })),
                 )?;
             }
             Expr::Format(call) => {
                 if let Some(args) = &call.args {
                     for arg in args {
-                        arg.collect_vars::<Type<(), ()>, (), (), C>(
+                        arg.collect_vars::<C>(
                             vars,
-                            &Type::String(StringType {
+                            Some(&Type::String(StringType {
                                 span: arg.to_span(),
-                            }),
+                            })),
                         )?;
                     }
                 }
+            }
+            Expr::Join(call) => {
+                vars.collect(
+                    &call.variable,
+                    Some(&Type::String(StringType {
+                        span: call.to_span(),
+                    })),
+                )?;
             }
             Expr::Or(or) => vars.collect(&or.variable, suggested_type)?,
             _ => {}
@@ -1322,21 +1514,27 @@ impl Parse for ObjectConstantField {
 
 impl Variable {
     fn continue_to_parse(input: ParseStream, dollar: Token![$]) -> syn::Result<Self> {
+        let client_option = input.try_parse_dollar();
+        let dollar = client_option
+            .as_ref()
+            .map(|d| (dollar.span(), d.span()).to_span())
+            .unwrap_or(dollar.span());
+        let client_option = client_option.is_some();
         let name = input.parse()?;
         Ok(if input.peek(Token![:]) {
-            Type::<(), ()>::peek(input)?;
+            Type::peek(input)?;
             Self {
-                dollar: dollar.span,
+                dollar,
                 name,
-                typ: Some(Type::parse_type(input)?),
-                client_option: false,
+                typ: Some(Type::parse(input)?),
+                client_option,
             }
         } else {
             Self {
-                dollar: dollar.span,
+                dollar,
                 name,
                 typ: None,
-                client_option: false,
+                client_option,
             }
         })
     }
