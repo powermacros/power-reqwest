@@ -37,8 +37,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-addsmssign
     post add_sms_sign("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "AddSmsSign",
+        }
+        urlencoded {
             SignName: string = $sign_name,
             SignSource: uint(0..=5) = $sign_source,
             SignFileList {
@@ -59,8 +61,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-deletesmssign
     post delete_sms_sign("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "DeleteSmsSign",
+        }
+        urlencoded {
             SignName: string = $sign_name
         }
     } -> {
@@ -74,8 +78,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-modifysmssign
     post modify_sms_sign("https://$$api.aliyuncs.com") {
-        urlenc: common_request {
+        query: common_request {
             Action: "ModifySmsSign",
+        }
+        urlencoded {
             SignName: string = $sign_name,
             SignSource: uint(0..=5) = $sign_source,
             SignFileList {
@@ -96,7 +102,7 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysmssignlist
     post query_sms_sign_list("https://$$api.aliyuncs.com") {
-        urlenc: common_request {
+        query: common_request {
             Action: "QuerySmsSignList",
             PageIndex?: uint(1..) = $page_index,
             PageSize?: uint(1..=50) = $page_size
@@ -125,8 +131,10 @@ reqwest! {
     }
 
     post query_sms_sign("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QuerySmsSign",
+        }
+        urlencoded {
             SignName: string = $sign_name
         }
     } -> {
@@ -152,8 +160,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-addsmstemplate
     post add_sms_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "AddSmsTemplate",
+        }
+        urlencoded {
             TemplateType: uint(0..=3) = $template_type,
             TemplateName: string = $template_name,
             TemplateContent: string = $template_content,
@@ -170,8 +180,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-deletesmstemplate
     post delete_sms_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "DeleteSmsTemplate",
+        }
+        urlencoded {
             TemplateCode: string = $template_code,
         }
     } -> {
@@ -185,8 +197,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-modifysmstemplate
     post modify_sms_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "ModifySmsTemplate",
+        }
+        urlencoded {
             TemplateCode: string = $template_code,
             TemplateType: uint(0..=3) = $template_type,
             TemplateName: string = $template_name,
@@ -204,8 +218,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysmstemplatelist
     post query_sms_template_list("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QuerySmsTemplateList",
+        }
+        urlencoded {
             PageIndex?: uint(1..) = $page_index,
             PageSize?: uint(1..=50) = $page_size
         }
@@ -237,8 +253,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysmstemplate
     post query_sms_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QuerySmsTemplate",
+        }
+        urlencoded {
             TemplateCode: string = $template_code,
         }
     } -> {
@@ -267,8 +285,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-sendsms
     post send_sms("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "SendSms",
+        }
+        urlencoded {
             PhoneNumbers: string = join_string($phone_numbers: string[], ","),
             SignName: string = $sign_name,
             TemplateCode: string = $template_code,
@@ -286,8 +306,10 @@ reqwest! {
     }
 
     post send_batch_sms("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "SendBatchSms",
+        }
+        urlencoded {
             PhoneNumberJson: string = json($phone_numbers: string[]),
             SignNameJson: json(string[]) = $sign_names,
             TemplateCode: string = $template_code,
@@ -310,8 +332,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysenddetails
     post query_send_detail("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QuerySendDetails",
+        }
+        urlencoded {
             PhoneNumber: string = $phone_number,
             BizId: string = $biz_id,
             SendDate: datetime("%y%m%d") = $send_date,
@@ -341,8 +365,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querysendstatistics
     post query_send_statistics("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QuerySendStatistics",
+        }
+        urlencoded {
             IsGlobe: uint(1,2) = $globe,
             StartDate: string = datetime($start_date, "%y%m%d"),
             EndDate: string = datetime($end_date, "%y%m%d"),
@@ -372,8 +398,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-getossinfoforcardtemplate
     post get_oss_info_for_card_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "GetOSSInfoForCardTemplate"
+        }
+        urlencoded {
         }
     } -> {
         json {
@@ -395,8 +423,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-getmediaresourceid
     post get_media_resource_id("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "GetMediaResourceId",
+        }
+        urlencoded {
             ResourceType: uint(1,2,3,4) = $resource_type,
             OssKey: string = $oss_key,
             FileSize: uint = $file_size,
@@ -417,8 +447,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-createcardsmstemplate
     post create_card_sms_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "CreateCardSmsTemplate",
+        }
+        urlencoded {
             TemplateName: string = $template_name,
             // template: https://help.aliyun.com/zh/sms/parameters-of-card-sms-templates
             Template {
@@ -461,8 +493,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querycardsmstemplate
     post query_card_sms_template("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QueryCardSmsTemplate",
+        }
+        urlencoded {
             TemplateCode: string = $template_code
         }
     } -> {
@@ -491,8 +525,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-checkmobilescardsupport
     post check_mobiles_card_support("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "CheckMobilesCardSupport",
+        }
+        urlencoded {
             TemplateCode: string = $template_code,
             Mobiles: string = json($mobiles: string[])
         }
@@ -512,8 +548,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querymobilescardsupport
     post query_mobiles_card_support("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QueryMobilesCardSupport",
+        }
+        urlencoded {
             TemplateCode: string = $template_code,
             Mobiles: string = json($mobiles: string[])
         }
@@ -533,8 +571,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-getcardsmslink
     post get_card_sms_link("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "GetCardSmsLink",
+        }
+        urlencoded {
             CardTemplateCode: string = $card_template_code,
             OutId?: string = $out_id,
             PhoneNumberJson?: string = json($phone_numbers: string[]),
@@ -562,8 +602,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-querycardsmstemplatereport
     post query_card_sms_template_report("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "QueryCardSmsTemplateReport",
+        }
+        urlencoded {
             TemplateCodes: string[] = $template_codes,
             StartDate: string = datetime($start_date, "%y-%m-%d %H:%M:%S"),
             EndDate: string = datetime($end_date, "%y-%m-%d %H:%M:%S"),
@@ -589,8 +631,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-sendcardsms
     post send_card_sms("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "SendCardSms",
+        }
+        urlencoded {
             CardObjects: {
                 customUrl?: string,
                 dyncParams?: string,
@@ -626,8 +670,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-sendbatchcardsms
     post send_batch_card_sms("https://$$api.aliyuncs.com") {
-        form: {
+        query: common_request {
             Action: "SendBatchCardSms",
+        }
+        urlencoded {
             CardTemplateCode: string = $card_template_code,
             SmsTemplateCode: string = $sms_template_code,
             FallbackType: string = $fallback_type,
@@ -663,8 +709,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-smsconversionintl
     post sms_coversion_intl("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "SmsConversionIntl",
+        }
+        urlencoded {
             MessageId: string = $message_id,
             Delivered: bool = $delivered,
             ConversionTime?: uint = timestamp($conversion_time)
@@ -680,8 +728,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-conversiondataintl
     post conversion_data_intl("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "ConversionDataIntl",
+        }
+        urlencoded {
             ReportTime?: uint = timestamp($report_time),
             ConversionRate: string = format("{}", $conversion_rate: float)
         }
@@ -698,8 +748,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-listtagresources
     post list_tag_resources("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "ListTagResources",
+        }
+        urlencoded {
             ResourceType: string = $resource_type || "TEMPLATE",
             RegionId: string = $region_id,
             NextToken?: string = $next_token,
@@ -727,8 +779,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-tagresources
     post tag_resources("https://$$api.aliyuncs.com") {
-        urlencoded: common_request {
+        query: common_request {
             Action: "TagResources",
+        }
+        urlencoded {
             ResourceType: string = $resource_type || "TEMPLATE",
             RegionId: string = $region_id,
             ProdCode?: string = $prod_code || "dysms",
@@ -748,8 +802,10 @@ reqwest! {
 
     // https://help.aliyun.com/zh/sms/developer-reference/api-dysmsapi-2017-05-25-untagresources
    post untag_resources("https://$$api.aliyuncs.com") {
-        form: {
+        query: common_request {
             Action: "UntagResources",
+        }
+        urlencoded {
             ResourceType: string = $resource_type || "TEMPLATE",
             RegionId: string = $region_id,
             All: bool = $all,

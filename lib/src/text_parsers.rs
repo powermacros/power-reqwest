@@ -47,7 +47,11 @@ pub mod url_parser {
             },
         ) = uri(&value).map_err(|_| span.to_syn_error("bad url"))?;
 
+        let mut uri_format = schema.map(|s| s.to_owned()).unwrap_or_default();
         api.schema = schema.map(|schema| (schema, span).to_lit_str());
+        if schema.is_some() {
+            uri_format.push_str("://");
+        }
         api.user = auth.map(|(user, _)| (user, span).to_lit_str());
         api.passwd = auth
             .map(|(_, pswd)| pswd.map(|pswd| (pswd, span).to_lit_str()))
@@ -66,11 +70,11 @@ pub mod url_parser {
                     {
                         span.to_syn_error("unsupported ip address").to_err()?;
                     }
-                    api.uri_format = (ip.to_string(), span).to_lit_str();
+                    uri_format.push_str(&ip.to_string());
                 }
                 IpOrHost::Host(host_segs) => {
-                    api.uri_format = (
-                        host_segs
+                    uri_format.push_str(
+                        &host_segs
                             .iter()
                             .map(|seg| match seg {
                                 HostSeg::Seg(s) => *s,
@@ -78,9 +82,7 @@ pub mod url_parser {
                             })
                             .collect::<Vec<_>>()
                             .join("."),
-                        span,
-                    )
-                        .to_lit_str();
+                    );
                     api.uri_variables = host_segs
                         .iter()
                         .filter_map(|seg| match seg {
@@ -92,12 +94,16 @@ pub mod url_parser {
             };
         }
         if let Some(port) = port {
+            uri_format.push(':');
             match port {
                 PortOrVar::Port(port) => {
+                    uri_format.push_str(&format!("{port}"));
                     api.port = Some(LitInt::new(&format!("{port}"), span));
                 }
                 PortOrVar::Var(var) => {
+                    uri_format.push_str("{}");
                     api.port_var = Some(var.to_variable(span));
+                    api.uri_variables.push(var.to_variable(span));
                 }
             }
         }
@@ -105,15 +111,36 @@ pub mod url_parser {
             |UrlPath {
                  segments,
                  last_slash,
-             }| ApiUriPath {
-                last_slash,
-                segments: segments
+             }| {
+                let segments = segments
                     .into_iter()
-                    .map(|seg| match seg {
-                        Segment::CodePoints(s) => ApiUriSeg::Static((s, span).to_lit_str()),
-                        Segment::Variable(v) => ApiUriSeg::Var(v.to_variable(span)),
+                    .map(|seg| {
+                        if !uri_format.ends_with("/") {
+                            uri_format.push('/');
+                        }
+                        match seg {
+                            Segment::CodePoints(s) => {
+                                uri_format.push_str(s);
+                                ApiUriSeg::Static((s, span).to_lit_str())
+                            }
+                            Segment::Variable(v) => {
+                                uri_format.push_str("{}");
+                                api.uri_variables.push(v.to_variable(span));
+                                ApiUriSeg::Var(v.to_variable(span))
+                            }
+                        }
                     })
-                    .collect(),
+                    .collect();
+                if last_slash {
+                    if !uri_format.ends_with("/") {
+                        uri_format.push('/');
+                    }
+                }
+
+                ApiUriPath {
+                    last_slash,
+                    segments,
+                }
             },
         );
         api.uri_query = query.map(|UrlQuery { params }| ApiUriQuery {
@@ -144,6 +171,7 @@ pub mod url_parser {
                 })
                 .collect::<Vec<_>>(),
         });
+        api.uri_format = (uri_format, span).to_lit_str();
         api.fragment = fragment.map(|f| (f, span).to_lit_str());
         Ok(())
     }

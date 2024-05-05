@@ -22,7 +22,8 @@ impl Parse for Client {
         let whole_span = input.span();
         let mut client = Self {
             name: Ident::new("_", whole_span),
-            options: None,
+            options: Default::default(),
+            option_map: Default::default(),
             hooks: None,
             apis: vec![],
             templates: HashMap::new(),
@@ -49,11 +50,14 @@ impl Parse for Client {
                         .to_syn_error("duplicated client params(options) config")
                         .to_err()?;
                 }
-                input.try_parse_colon();
-                let params = BracedConfig::parse(input, ident.span(), true, false, true)?;
+                let extend = BracedConfig::peek_and_parse_extend(input)?;
+                let params = BracedConfig::parse(input, ident.span(), extend, true, false, true)?;
                 for field in params.fields.iter() {
                     field.requires_to_simple_type()?;
                     field.check_constant_expr_with_type()?;
+                    client
+                        .option_map
+                        .insert(field.field_name.clone(), field.clone());
                 }
                 client.options = Some(params);
             } else if let Some(templates) = DataTemplates::try_parse(input)? {
@@ -96,22 +100,13 @@ impl Parse for Client {
         if let Some(options) = client.options.as_mut() {
             options.struct_name = client.name.with_suffix("Options");
         }
+        client.flatten_templates()?;
 
         for api in client.apis.iter_mut() {
             api.extend_templates(&client.templates)?;
         }
 
         client.resolve_object_type_names()?;
-
-        let option_map = if let Some(options) = &client.options {
-            options
-                .fields
-                .iter()
-                .map(|f| (&f.field_name, f.typ.as_ref()))
-                .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
-        };
 
         for (name, template) in client.templates.iter() {
             let mut extends = vec![];
@@ -128,7 +123,7 @@ impl Parse for Client {
         }
 
         for api in client.apis.iter_mut() {
-            api.collect_and_check_vars(&option_map)?;
+            api.collect_and_check_vars(&client.option_map)?;
         }
 
         Ok(client)
@@ -150,10 +145,9 @@ impl Client {
             };
 
             if let Some(response) = &mut api.response {
-                if let Some(json) = &mut response.json {
-                    json.resolve_types(prefix.with_suffix("ResponseData"))?;
-                } else if let Some(form) = &mut response.form {
-                    form.resolve_types(prefix.with_suffix("ResponseData"))?;
+                if let Some(data) = &mut response.data {
+                    data.data
+                        .resolve_types(prefix.with_suffix("ResponseData"))?;
                 }
                 if let Some(headers) = &mut response.header {
                     headers.resolve_types(prefix.with_suffix("ResponseHeaders"))?;
@@ -163,6 +157,56 @@ impl Client {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn flatten_templates(&mut self) -> syn::Result<()> {
+        fn lookup<'a>(
+            templates: &'a HashMap<Ident, DataTemplate>,
+            template: &'a DataTemplate,
+            g: &mut Vec<(Ident, Ident)>,
+        ) -> syn::Result<()> {
+            if let Some(extend) = &template.fields.extend {
+                g.push((template.name.clone(), extend.clone()));
+                if let Some(super_template) = templates.get(extend) {
+                    lookup(templates, super_template, g)?;
+                } else {
+                    extend.to_syn_error("no such template").to_err()?;
+                }
+            }
+            Ok(())
+        }
+
+        let reversed_extends = self
+            .templates
+            .iter()
+            .map(|(_, template)| {
+                let mut idents = vec![];
+                lookup(&self.templates, template, &mut idents)?;
+                Ok(if !idents.is_empty() {
+                    idents.reverse();
+                    Some(idents)
+                } else {
+                    None
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten();
+
+        let mut flags = HashSet::with_capacity(self.templates.len());
+        for names in reversed_extends {
+            for (name, extend) in names {
+                if flags.contains(&name) {
+                    continue;
+                }
+                let super_template = self.templates.get(&extend).map(|t| t.clone()).unwrap();
+                let template = self.templates.get_mut(&name).unwrap();
+                template.extend(super_template)?;
+                flags.insert(name);
+            }
+        }
+
         Ok(())
     }
 }
@@ -232,11 +276,10 @@ impl DataTemplate {
         } else {
             None
         };
-        let template = BracedConfig::parse(input, name.span(), true, true, true)?;
+        let template = BracedConfig::parse(input, name.span(), extend, true, true, true)?;
         Ok(Self {
             span: token_span,
             name,
-            extend,
             fields: template,
         })
     }
@@ -257,7 +300,7 @@ impl DataTemplate {
         if path.contains(&&self.name) {
             return Ok(true);
         }
-        if let Some(extend) = &self.extend {
+        if let Some(extend) = &self.fields.extend {
             if let Some(next) = templates.get(extend) {
                 path.push(extend);
                 next.check_recycle_ref(templates, path)
@@ -267,6 +310,27 @@ impl DataTemplate {
         } else {
             Ok(false)
         }
+    }
+
+    fn extend(&mut self, super_template: Self) -> syn::Result<()> {
+        for field in super_template.fields.fields.into_iter().rev() {
+            if self.fields.removed_fields.contains(&field.name) {
+                continue;
+            }
+            if let Some((index, _)) = self
+                .fields
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.name.eq(&field.name))
+            {
+                let field = self.fields.fields.remove(index);
+                self.fields.fields.insert(0, field);
+            } else {
+                self.fields.fields.insert(0, field);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -305,26 +369,35 @@ impl Api {
     }
 
     fn extend_templates(&mut self, templates: &HashMap<Ident, DataTemplate>) -> syn::Result<()> {
+        if let Some(header) = &mut self.request.header {
+            header.extend_templates(templates)?;
+        }
+        if let Some(query) = &mut self.request.query {
+            query.extend_templates(templates)?;
+        }
         if let Some(data) = &mut self.request.data {
-            if let Some(extend) = &data.extend {
-                data.data.extend_templates(extend, templates)?;
+            data.data.extend_templates(templates)?;
+        }
+        if let Some(response) = &mut self.response {
+            if let Some(header) = &mut response.header {
+                header.extend_templates(templates)?;
+            }
+            if let Some(cookie) = &mut response.cookie {
+                cookie.extend_templates(templates)?;
             }
         }
         Ok(())
     }
 
-    fn collect_and_check_vars(
-        &mut self,
-        options: &HashMap<&Ident, Option<&Type>>,
-    ) -> syn::Result<()> {
+    fn collect_and_check_vars(&mut self, options: &HashMap<Ident, Field>) -> syn::Result<()> {
         self.uri.collect_vars(&mut self.variables)?;
         self.request.collect_vars(&mut self.variables)?;
 
         for var in self.variables.iter_mut() {
             if var.client_option {
-                if let Some(opt_type) = options.get(&var.name) {
+                if let Some(opt) = options.get(&var.name) {
                     if let Some(typ) = &var.typ {
-                        if let Some(opt_type) = opt_type {
+                        if let Some(opt_type) = &opt.typ {
                             if opt_type.ne(&typ) {
                                 (typ.to_span(), opt_type.to_span())
                                     .to_span()
@@ -333,7 +406,7 @@ impl Api {
                             }
                         }
                     } else {
-                        var.typ = opt_type.map(|t| t.pure());
+                        var.typ = opt.typ.as_ref().map(|t| t.pure());
                     }
                 } else {
                     var.name.to_syn_error("no such option").to_err()?;
@@ -419,7 +492,7 @@ impl ApiRequest {
                 if let Some(prev) = &request.data {
                     (data.data.token, prev.data.token)
                         .to_span()
-                        .to_syn_error("duplicated json config")
+                        .to_syn_error("duplicated request body config")
                         .to_err()?;
                 }
                 request.data = Some(data);
@@ -430,10 +503,11 @@ impl ApiRequest {
                         .to_syn_error("duplicated query config")
                         .to_err()?;
                 }
-                inner.try_parse_colon();
+                let extend = BracedConfig::peek_and_parse_extend(&inner)?;
                 request.query = Some(BracedConfig::parse(
                     &inner,
                     query.span(),
+                    extend,
                     true,
                     false,
                     true,
@@ -446,10 +520,11 @@ impl ApiRequest {
                         .to_syn_error("duplicated header config")
                         .to_err()?;
                 }
-                input.try_parse_colon();
+                let extend = BracedConfig::peek_and_parse_extend(&inner)?;
                 request.header = Some(BracedConfig::parse(
                     &inner,
                     header.span(),
+                    extend,
                     false,
                     false,
                     true,
@@ -493,25 +568,14 @@ impl ApiRequestData {
         if let Some(ident) =
             input.try_parse_one_of_idents(("json", "form", "urlencoded", "urlencode", "urlenc"))
         {
-            let extend = if let Some(_colon) = input.try_parse_colon() {
-                if input.peek(Ident) {
-                    Some(input.parse()?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let data = BracedConfig::parse(input, ident.span(), true, true, true)?;
+            let extend = BracedConfig::peek_and_parse_extend(input)?;
+            let data = BracedConfig::parse(input, ident.span(), extend, true, true, true)?;
             let data_var = ApiRequest::parse_var_part(input)?;
             Ok(Some(Self {
-                extend,
                 data_type: match ident.to_string().as_str() {
-                    "json" => RequstDataType::Json(ident.span()),
-                    "form" => RequstDataType::Form(ident.span()),
-                    "urlencoded" | "urlencode" | "urlenc" => {
-                        RequstDataType::Urlencoded(ident.span())
-                    }
+                    "json" => DataType::Json(ident.span()),
+                    "form" => DataType::Form(ident.span()),
+                    "urlencoded" | "urlencode" | "urlenc" => DataType::Urlencoded(ident.span()),
                     _ => {
                         unreachable!()
                     }
@@ -578,8 +642,7 @@ impl Parse for ApiResponse {
             brace,
             header: None,
             cookie: None,
-            json: None,
-            form: None,
+            data: None,
         };
 
         while !inner.is_empty() {
@@ -587,24 +650,14 @@ impl Parse for ApiResponse {
                 continue;
             }
 
-            if let Some(json) = inner.try_parse_as_ident("json", false) {
-                if let Some(prev) = &response.json {
-                    (json.span(), prev.token)
+            if let Some(data) = ApiResponseData::try_parse(&inner)? {
+                if let Some(prev) = &response.data {
+                    (data.data.brace.span.close(), prev.data.brace.span.close())
                         .to_span()
                         .to_syn_error("duplicated json config")
                         .to_err()?;
                 }
-                inner.try_parse_colon();
-                response.json = Some(BracedConfig::parse(&inner, json.span(), true, true, false)?);
-            } else if let Some(form) = inner.try_parse_as_ident("form", false) {
-                if let Some(prev) = &response.form {
-                    (form.span(), prev.token)
-                        .to_span()
-                        .to_syn_error("duplicated form config")
-                        .to_err()?;
-                }
-                inner.try_parse_colon();
-                response.form = Some(BracedConfig::parse(&inner, form.span(), true, true, false)?);
+                response.data = Some(data);
             } else if let Some(cookie) = inner.try_parse_as_ident("cookie", false) {
                 if let Some(prev) = &response.cookie {
                     (cookie.span(), prev.token)
@@ -612,10 +665,11 @@ impl Parse for ApiResponse {
                         .to_syn_error("duplicated cookie config")
                         .to_err()?;
                 }
-                inner.try_parse_colon();
+                let extend = BracedConfig::peek_and_parse_extend(&inner)?;
                 response.cookie = Some(BracedConfig::parse(
                     &inner,
                     cookie.span(),
+                    extend,
                     false,
                     true,
                     false,
@@ -627,10 +681,11 @@ impl Parse for ApiResponse {
                         .to_syn_error("duplicated header config")
                         .to_err()?;
                 }
-                inner.try_parse_colon();
+                let extend = BracedConfig::peek_and_parse_extend(&inner)?;
                 response.header = Some(BracedConfig::parse(
                     &inner,
                     header.span(),
+                    extend,
                     false,
                     true,
                     false,
@@ -646,11 +701,46 @@ impl Parse for ApiResponse {
         Ok(response)
     }
 }
+impl ApiResponseData {
+    fn try_parse(input: ParseStream) -> syn::Result<Option<Self>> {
+        if let Some(ident) =
+            input.try_parse_one_of_idents(("json", "form", "urlencoded", "urlencode", "urlenc"))
+        {
+            let extend = BracedConfig::peek_and_parse_extend(input)?;
+            let data = BracedConfig::parse(input, ident.span(), extend, true, true, true)?;
+            Ok(Some(Self {
+                data_type: match ident.to_string().as_str() {
+                    "json" => DataType::Json(ident.span()),
+                    "form" => DataType::Form(ident.span()),
+                    "urlencoded" | "urlencode" | "urlenc" => DataType::Urlencoded(ident.span()),
+                    _ => {
+                        unreachable!()
+                    }
+                },
+                data,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
 
 impl BracedConfig {
+    fn peek_and_parse_extend(input: ParseStream) -> syn::Result<Option<Ident>> {
+        Ok(if let Some(_colon) = input.try_parse_colon() {
+            if input.peek(Ident) {
+                Some(input.parse()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        })
+    }
     fn parse(
         input: ParseStream,
         token: Span,
+        extend: Option<Ident>,
         parse_type: bool,
         parse_alias: bool,
         parse_assignment: bool,
@@ -697,6 +787,7 @@ impl BracedConfig {
         }
         Ok(Self {
             token,
+            extend,
             struct_name: ("_", token).to_ident(),
             brace,
             fields,
@@ -713,28 +804,25 @@ impl BracedConfig {
         Ok(())
     }
 
-    fn extend_templates(
-        &mut self,
-        extend: &Ident,
-        templates: &HashMap<Ident, DataTemplate>,
-    ) -> syn::Result<()> {
-        if let Some(template) = templates.get(extend) {
-            for field in template.fields.fields.iter() {
-                if self.removed_fields.contains(&field.name) {
-                    continue;
+    fn extend_templates(&mut self, templates: &HashMap<Ident, DataTemplate>) -> syn::Result<()> {
+        if let Some(extend) = &self.extend {
+            if let Some(template) = templates.get(extend) {
+                for field in template.fields.fields.iter().rev() {
+                    if self.removed_fields.contains(&field.name) {
+                        continue;
+                    }
+                    if let Some((index, _)) = self
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, f)| f.name.eq(&field.name))
+                    {
+                        let field = self.fields.remove(index);
+                        self.fields.insert(0, field);
+                    } else {
+                        self.fields.insert(0, field.clone());
+                    }
                 }
-                if self
-                    .fields
-                    .iter()
-                    .find(|f| f.name.eq(&field.name))
-                    .is_some()
-                {
-                    continue;
-                }
-                self.fields.push(field.clone());
-            }
-            if let Some(extend) = &template.extend {
-                self.extend_templates(extend, templates)?;
             }
         }
 
@@ -1194,9 +1282,6 @@ impl Field {
             if let Expr::Constant(c) = x {
                 default = Some(c.to_value());
             }
-        }
-        if let Some(opt) = &optional {
-            default = Some(syn::Path::from_ident(("None", opt.span()).to_ident()).to_expr());
         }
         Ok(Self {
             name,

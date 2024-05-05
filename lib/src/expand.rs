@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use crate::*;
+use convert_case::Case;
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens, TokenStreamExt};
 use syn::{spanned::Spanned, Ident, Path};
-use syn_prelude::{PathHelpers, ToIdent, ToLitStr};
+use syn_prelude::{PathHelpers, ToIdent, ToIdentWithCase, ToLitStr};
 
 fn make_chrono_datetime_type(span: Span) -> syn::Type {
     let utc = syn::Path::from_idents(("chrono", "Utc", span));
@@ -153,10 +156,8 @@ impl Api {
         }
 
         if let Some(response) = response {
-            if let Some(json) = &response.json {
-                types.extend(json.gen_obj_structs());
-            } else if let Some(form) = &response.form {
-                types.extend(form.gen_obj_structs());
+            if let Some(data) = &response.data {
+                types.extend(data.data.gen_obj_structs());
             }
             if let Some(cookies) = &response.cookie {
                 types.extend(cookies.gen_obj_structs());
@@ -166,23 +167,82 @@ impl Api {
             }
         }
 
-        let args = variables.iter().map(|Variable { name, typ, .. }| {
-            if let Some(typ) = &typ {
-                let typ = typ.to_type();
-                quote!(#name: #typ)
-            } else {
-                quote!(#name: String)
-            }
-        });
+        let mut args = variables
+            .iter()
+            .map(|Variable { name, typ, .. }| {
+                if let Some(typ) = &typ {
+                    let typ = typ.to_type();
+                    quote!(#name: #typ)
+                } else {
+                    quote!(#name: String)
+                }
+            })
+            .collect::<Vec<_>>();
+        args.insert(0, quote! {&self});
+
+        let method = self.method.to_ident_with_case(Case::Upper);
+        let url = self.uri.gen_url_format_expr(&client.option_map);
+        let basic_auth = self.uri.gen_basic_auth();
 
         quote! {
             #(#types)*
 
             impl #client_name {
                 pub async fn #name(#(#args),*) {
-
+                    let mut req = self.inner.request(reqwest::Method::#method, #url);
+                    #basic_auth
                 }
             }
+        }
+    }
+}
+
+impl ApiUri {
+    fn gen_url_format_expr(&self, options: &HashMap<Ident, Field>) -> TokenStream {
+        let Self {
+            uri_format,
+            uri_variables,
+            ..
+        } = self;
+        if uri_variables.is_empty() {
+            uri_format.to_token_stream()
+        } else {
+            let args = uri_variables.iter().map(
+                |Variable {
+                     name,
+                     client_option,
+                     ..
+                 }| {
+                    if *client_option {
+                        let opt = options.get(name).unwrap();
+                        if opt.optional.is_some() {
+                            if let Some(default) = &opt.default {
+                                quote!(self.options.#name.as_ref().map(|v|v.to_owned()).unwrap_or(#default))
+                            } else {
+                                quote!(self.options.#name.as_ref().map(|v|v.to_owned()).unwrap_or_default())
+                            }
+                        } else {
+                            quote!(&self.options.#name)
+                        }
+                    } else {
+                        quote!(&#name)
+                    }
+                },
+            );
+            quote!(format!(#uri_format, #(#args),*))
+        }
+    }
+    fn gen_basic_auth(&self) -> Option<TokenStream> {
+        let Self { user, passwd, .. } = self;
+        if let Some(user) = user {
+            let pass = if let Some(passwd) = passwd {
+                quote!(Some(#passwd))
+            } else {
+                quote!(None)
+            };
+            Some(quote!(req = req.basic_auth(#user, #pass)))
+        } else {
+            None
         }
     }
 }
@@ -237,12 +297,16 @@ fn make_object_struct(name: &Ident, fields: &Vec<Field>) -> TokenStream {
         |Field {
              field_name,
              default,
+             optional,
              ..
          }| {
-            let default = default
+            let mut default = default
                 .as_ref()
                 .map(|x| x.to_token_stream())
                 .unwrap_or(quote!(Default::default()));
+            if optional.is_some() {
+                default = quote!(Some(#default));
+            }
             quote! {
                 #field_name: #default
             }

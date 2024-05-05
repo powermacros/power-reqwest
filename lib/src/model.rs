@@ -12,6 +12,7 @@ use syn::{
 pub struct Client {
     pub name: Ident,
     pub options: Option<BracedConfig>,
+    pub option_map: HashMap<Ident, Field>,
     pub hooks: Option<Hooks>,
     pub apis: Vec<Api>,
     pub templates: HashMap<Ident, DataTemplate>,
@@ -32,7 +33,6 @@ pub struct DataTemplates {
 pub struct DataTemplate {
     pub(crate) span: Span,
     pub name: Ident,
-    pub extend: Option<Ident>,
     pub fields: BracedConfig,
 }
 
@@ -97,14 +97,13 @@ pub struct ApiRequest {
 
 #[derive(Clone, Debug)]
 pub struct ApiRequestData {
-    pub extend: Option<Ident>,
-    pub data_type: RequstDataType,
+    pub data_type: DataType,
     pub data: BracedConfig,
     pub data_var: Option<Ident>,
 }
 
 #[derive(Clone, Debug)]
-pub enum RequstDataType {
+pub enum DataType {
     Json(Span),
     Form(Span),
     Urlencoded(Span),
@@ -115,8 +114,13 @@ pub struct ApiResponse {
     pub brace: Brace,
     pub header: Option<BracedConfig>,
     pub cookie: Option<BracedConfig>,
-    pub json: Option<BracedConfig>,
-    pub form: Option<BracedConfig>,
+    pub data: Option<ApiResponseData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApiResponseData {
+    pub data_type: DataType,
+    pub data: BracedConfig,
 }
 
 pub trait TryParse {
@@ -128,6 +132,7 @@ pub trait TryParse {
 #[derive(Clone, Debug)]
 pub struct BracedConfig {
     pub token: Span,
+    pub extend: Option<Ident>,
     pub struct_name: Ident,
     pub brace: Brace,
     pub fields: Vec<Field>,
